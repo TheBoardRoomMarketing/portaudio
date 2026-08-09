@@ -1,0 +1,8 @@
+# Regenerable: rebuild with `python3 scripts/build_synthetic.py`
+build/
+
+# The repository root .gitignore carries a broad `build*` rule (it targets
+# CMake output directories). That pattern also swallows our two build scripts,
+# so re-include them explicitly.
+!scripts/build_synthetic.py
+!prototype/build_bundle.py
