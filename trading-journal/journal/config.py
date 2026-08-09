@@ -37,6 +37,18 @@ RUNTIME_DIRS = (DATA_HOME, RAW_DIR, MEDIA_DIR, BACKUP_DIR, EXPORT_DIR)
 DEFAULT_TZ = "America/New_York"
 DEFAULT_SESSION_KIND = "NY_AM"
 
+# Declared trading window per session kind, as local wall clock. A session
+# carries its window so "traded outside the planned window" is measurable
+# against something the trader declared, not against an assumption made later.
+# (None, None) means no declared window, which makes that conformance component
+# not applicable rather than passed.
+SESSION_WINDOWS = {
+    "NY_AM": ("09:30", "12:00"),
+    "NY_PM": ("12:00", "16:00"),
+    "OVERNIGHT": ("18:00", "09:30"),
+    "OTHER": (None, None),
+}
+
 # Bumped whenever a derived-metric definition changes. Every derived row stores
 # the version that produced it, so a definition change is always traceable.
 CALC_VERSION = "metrics@1.0.0"

@@ -12,6 +12,10 @@
     journal restore <archive>    restore from an archive
     journal verify <archive>     restore into scratch and check against manifest
     journal job <name>           run a scheduled job (used by launchd/cron)
+    journal weekly [week]        generate and store a descriptive weekly report
+    journal friction             capture-friction telemetry
+    journal review               the real-use checkpoint report
+    journal enrich-blinded       run a blinded research enricher (storage only)
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from . import backup, config, contracts, db, importers, metrics, repo
+from . import backup, config, contracts, db, enrich, importers, metrics, reports, repo
 from .db import utcnow
 
 
@@ -203,6 +207,13 @@ def cmd_job(args) -> int:
             backup.prune(30)
         elif args.name == "recompute":
             detail = json.dumps(metrics.recompute_all(conn, note="scheduled"))
+        elif args.name in ("weekly_review", "monthly_review"):
+            row = conn.execute(
+                "SELECT iso_week FROM session ORDER BY session_date DESC LIMIT 1").fetchone()
+            if not row:
+                raise RuntimeError("no sessions to report on")
+            payload = reports.store_weekly(conn, row["iso_week"])
+            detail = f"{row['iso_week']}: {payload.get('sessions', 0)} sessions, descriptive only"
         elif args.name in ("pre_session_checkin", "post_session_checkout"):
             # The job's only duty is to make sure the session row exists and to
             # hand the human a URL. It never fills anything in on their behalf.
@@ -230,6 +241,67 @@ def cmd_job(args) -> int:
         conn.commit()
         conn.close()
     return 0 if status == "ok" else 1
+
+
+def cmd_weekly(args) -> int:
+    conn = db.connect()
+    try:
+        week = args.week
+        if not week:
+            row = conn.execute(
+                "SELECT iso_week FROM session ORDER BY session_date DESC LIMIT 1").fetchone()
+            if not row:
+                print("no sessions yet", file=sys.stderr)
+                return 1
+            week = row["iso_week"]
+        _out(reports.store_weekly(conn, week) if args.store else reports.weekly(conn, week))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_friction(args) -> int:
+    conn = db.connect()
+    try:
+        _out(reports.friction(conn))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_review(args) -> int:
+    conn = db.connect()
+    try:
+        result = reports.real_use_review(conn)
+    finally:
+        conn.close()
+    _out(result)
+    if not result.get("checkpoint_reached"):
+        print(f"\nCheckpoint not yet reached: {result['sessions']} sessions "
+              "(needs 20 sessions or 4 weeks).", file=sys.stderr)
+    return 0
+
+
+def cmd_enrich_blinded(args) -> int:
+    """Storage only. Nothing here reads a feature back or analyses anything."""
+    try:
+        engine = enrich.load_engine(args.engine)
+    except enrich.EnrichmentError as exc:
+        print(f"could not load engine: {exc}", file=sys.stderr)
+        return 1
+
+    conn = db.connect(restricted=False)
+    try:
+        result = enrich.enrich(conn, engine, since=args.since, until=args.until,
+                               source_hypothesis=args.hypothesis, overwrite=args.overwrite)
+        result["coverage"] = enrich.coverage(conn)
+    except enrich.EnrichmentError as exc:
+        print(f"enrichment refused: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    _out(result)
+    return 0
 
 
 def cmd_contracts(args) -> int:
@@ -299,6 +371,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date")
     s.add_argument("--session-kind", default=config.DEFAULT_SESSION_KIND)
     s.set_defaults(func=cmd_job)
+
+    s = sub.add_parser("weekly", help="generate a descriptive weekly report")
+    s.add_argument("week", nargs="?", help="ISO week, e.g. 2026-W32 (default: most recent)")
+    s.add_argument("--store", action="store_true", help="save it to the report table")
+    s.set_defaults(func=cmd_weekly)
+
+    s = sub.add_parser("friction", help="capture-friction telemetry")
+    s.set_defaults(func=cmd_friction)
+
+    s = sub.add_parser("review", help="the real-use checkpoint report")
+    s.set_defaults(func=cmd_review)
+
+    s = sub.add_parser("enrich-blinded", help="run a blinded research enricher (storage only)")
+    s.add_argument("--engine", required=True, help="package.module:Attribute")
+    s.add_argument("--since", help="earliest session date")
+    s.add_argument("--until", help="latest session date")
+    s.add_argument("--hypothesis", default="unspecified",
+                   help="source hypothesis or feature-set revision this run belongs to")
+    s.add_argument("--overwrite", action="store_true",
+                   help="recompute sessions already enriched at this engine version")
+    s.set_defaults(func=cmd_enrich_blinded)
 
     s = sub.add_parser("contracts", help="integration contract status")
     s.set_defaults(func=cmd_contracts)

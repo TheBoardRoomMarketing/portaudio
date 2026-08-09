@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Protocol
 READY = "READY"
 BLOCKED_ON_STRATEGY_SPEC = "BLOCKED_ON_STRATEGY_SPEC"
 BLOCKED_ON_SAMPLE = "BLOCKED_ON_SAMPLE"
+BLOCKED_ON_ENGINE = "BLOCKED_ON_ENGINE"
 NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
 
 
@@ -128,11 +129,13 @@ REGISTRY = {
              "human-reported and derived from those reported prices, never guessed.",
     ),
     "ASTRO_BLINDED_ENRICHER": Adapter(
-        "ASTRO_BLINDED_ENRICHER", NOT_IMPLEMENTED,
-        blocked_by="astro engine interface from its owning project",
-        note="Blinded storage plumbing is live and tested: features can be written "
-             "against opaque keys today and are unreadable from every daily view. "
-             "No personal-astro analysis has been executed.",
+        "ASTRO_BLINDED_ENRICHER", BLOCKED_ON_ENGINE,
+        blocked_by="the astro engine itself, owned by its own project",
+        note="The storage path is implemented and tested end to end against a stub "
+             "engine: `journal enrich-blinded --engine pkg.mod:Engine` loads any object "
+             "satisfying BlindedEnricher, refuses non-opaque feature keys, and stores "
+             "values with session, engine hash, source hypothesis and timestamp. "
+             "Values remain unreadable from every daily view. No analysis executed.",
     ),
 }
 

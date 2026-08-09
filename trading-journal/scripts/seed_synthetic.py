@@ -384,16 +384,22 @@ def build_days():
                                  direction=rng.choice(["long", "short"]), status="MISSED",
                                  detection_source="engine",
                                  status_reason="Alert fired with nobody at the desk."))
+            # Fill times and optional-section usage vary, so friction telemetry
+            # has something to report before real sessions exist.
             days[d] = dict(label="filler", pre=pre(sleep_hours=round(rng.uniform(5.5, 8.2), 1),
                                                    energy=rng.randint(2, 5),
                                                    focus=rng.randint(2, 5),
                                                    stress=rng.randint(1, 4),
-                                                   desire_to_trade=rng.randint(2, 5)),
+                                                   desire_to_trade=rng.randint(2, 5),
+                                                   fill_seconds=rng.randint(31, 78),
+                                                   optional_opened=1 if rng.random() < 0.25 else 0),
                            post=post(execution_quality=rng.randint(2, 5),
                                      rule_adherence=rng.randint(3, 5),
                                      patience=rng.randint(2, 5),
                                      emotional_control=rng.randint(3, 5),
-                                     well_traded=rng.choice(["yes", "yes", "mixed"])),
+                                     well_traded=rng.choice(["yes", "yes", "mixed"]),
+                                     fill_seconds=rng.randint(62, 155),
+                                     optional_opened=1 if rng.random() < 0.4 else 0),
                            trades=trades, opportunities=opps)
         d += timedelta(days=1)
 

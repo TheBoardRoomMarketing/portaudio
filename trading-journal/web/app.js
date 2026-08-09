@@ -82,6 +82,23 @@
     if (Math.abs(d) < 0.005) return "matched the rules";
     return d > 0 ? "discretion added" : "discretion cost";
   }
+  /* The two process views are never merged and a gap is never a verdict.
+     Mirrors journal/conformance.py:describe_disagreement. */
+  function disagreement(selfReported, mechanical) {
+    if (selfReported == null || mechanical == null) return null;
+    var gap = Math.round((selfReported - mechanical) * 10) / 10;
+    var size = Math.abs(gap);
+    return {
+      gap: gap,
+      band: size < 10 ? "aligned" : (size < 25 ? "some difference" : "large difference"),
+      sentence: size < 10
+        ? "Your sense of the session and the recorded conformance broadly agree."
+        : (gap > 0
+            ? "You rated the session above what the record counted. Worth a look at which."
+            : "The record counted more conformance than your own rating. Worth a look at which.")
+    };
+  }
+
   function outcomeWord(r) { return r == null ? "no result" : r > 0.0001 ? "gain" : r < -0.0001 ? "loss" : "scratch"; }
 
   /* deterministic PRNG so generated chart paths never move between renders */
@@ -565,12 +582,8 @@
         (trades.length ? '<div class="stack">' + trades.map(function (t) { return tradeCard(t); }).join("") + "</div>"
                        : '<p class="muted">No trades taken.</p>') + "</section>" +
         oppCard(opps) + reflectionCard(s);
-      right = '<section class="card"><div class="card-head"><span class="eyebrow">How the day scored</span></div>' +
-        dial(mm.self_reported_process_index, "Self-reported process index") +
-        '<p class="small muted" style="margin-top:12px">Contains no P&amp;L term: rule adherence, ' +
-        "execution, patience, emotional control and plan conformance. Four of its five inputs " +
-        "are your own ratings, so it measures consistency, not objective quality.</p>" +
-        '<hr class="divider" style="margin:16px 0">' +
+      right = processViewsCard(mm) +
+        '<section class="card"><div class="card-head"><span class="eyebrow">After the close</span></div>' +
         '<div class="stack-sm">' +
           rating("Execution quality", (s.post || {}).execution_quality) +
           rating("Rule adherence", (s.post || {}).rule_adherence) +
@@ -756,9 +769,11 @@
       '<div class="stats stats-4">' +
         stat("Net P&L", fmtMoney(mm.net_pnl), outcomeWord(mm.net_pnl), cls(mm.net_pnl)) +
         stat("R", fmtR(mm.total_r), (mm.trade_count || 0) + " trades · " + (mm.win_count || 0) + " winners") +
-        stat("Process index", fmtNum(mm.self_reported_process_index, 0), "self-reported · no P&L", "sm") +
-        stat("Rule adherence", (mm.rule_adherence || "—") + "/5",
-             (mm.mistake_count || 0) + (mm.mistake_count === 1 ? " flag" : " flags"), "sm") +
+        stat("Felt", fmtNum(mm.self_reported_process_index, 0), "self-reported process", "sm") +
+        stat("Recorded",
+             mm.mechanical_conformance_index == null ? "—"
+               : fmtNum(mm.mechanical_conformance_index, 0),
+             "mechanical conformance", "sm") +
       "</div>" +
       '<div class="stats stats-3" style="border-top:1px solid var(--rule);border-radius:0">' +
         stat("Qualified setups", String(mm.opportunities_total || 0),
@@ -786,9 +801,8 @@
                          : '<p class="muted">No trades taken this session.</p>') + "</section>" +
         oppCard(s.opportunities) +
       "</div><div class=\"stack\">" +
-        '<section class="card"><div class="card-head"><span class="eyebrow">How I traded</span></div>' +
-        dial(mm.self_reported_process_index, "Self-reported process index") +
-        '<hr class="divider" style="margin:16px 0">' +
+        processViewsCard(mm) +
+        '<section class="card"><div class="card-head"><span class="eyebrow">The session state</span></div>' +
         '<span class="eyebrow">Before the open</span><div class="stack-sm" style="margin-bottom:14px">' +
           rating("Energy", pre.energy) + rating("Focus", pre.focus) + rating("Stress", pre.stress, true) +
           '<div class="rating"><span class="lbl">Sleep</span><span class="num">' + fmtNum(pre.sleep_hours, 1) + " h</span></div>" +
@@ -803,6 +817,65 @@
         voiceCard(s) +
         marketCard(s) +
       "</div></div>";
+  }
+
+  /* Two process views, side by side, never collapsed into one number. */
+  function processViewsCard(mm) {
+    var selfReported = mm.self_reported_process_index;
+    var mechanical = mm.mechanical_conformance_index;
+    var gap = disagreement(selfReported, mechanical);
+    var available = [], missing = [];
+    try { available = JSON.parse(mm.conformance_components_available || "[]"); } catch (e) {}
+    try { missing = JSON.parse(mm.conformance_components_missing || "[]"); } catch (e) {}
+    var measurable = missing.filter(function (k) { return k !== "entry_deviation"; });
+
+    return '<section class="card"><div class="card-head"><span class="eyebrow">Process</span>' +
+      '<span class="muted small">two views, kept apart</span></div>' +
+      '<div class="grid g-2" style="gap:18px">' +
+        '<div>' + dial(selfReported, "How I felt I traded") +
+          '<p class="small muted" style="margin-top:10px">Your four ratings and the plan you ' +
+          "set. Self-reported.</p></div>" +
+        '<div>' + dial(mechanical, "What the record shows") +
+          '<p class="small muted" style="margin-top:10px">' +
+          (mechanical == null
+            ? "Nothing countable happened this session."
+            : "Counted from " + available.length + " of " +
+              (available.length + measurable.length) + " measurable components." +
+              (measurable.length ? " Not applicable today: " +
+                measurable.map(function (k) { return k.replace(/_/g, " "); }).join(", ") + "." : "")) +
+          "</p></div>" +
+      "</div>" +
+      (gap ? '<div class="reflect-item" style="margin-top:16px;border-left-color:' +
+        (gap.band === "aligned" ? "var(--rule-2)" : "var(--accent)") + '">' +
+        '<span class="k">' + esc(gap.band) + " · " +
+        (gap.gap > 0 ? "+" : gap.gap < 0 ? MINUS : "") + Math.abs(gap.gap).toFixed(1) +
+        '</span><span class="t" style="font-size:14.5px">' + esc(gap.sentence) + "</span></div>" : "") +
+      '<details class="disclosure" style="margin-top:6px"><summary>How the record was counted</summary>' +
+      conformanceDetail(mm) + "</details>" +
+      "</section>";
+  }
+
+  function conformanceDetail(mm) {
+    var detail = {};
+    try { detail = JSON.parse(mm.conformance_detail || "{}"); } catch (e) { return ""; }
+    var keys = Object.keys(detail);
+    if (!keys.length) return '<p class="muted small">Not computed for this session.</p>';
+    return '<div class="stack-sm">' + keys.map(function (k) {
+      var d = detail[k];
+      var label = k.replace(/_/g, " ");
+      if (d.status === "measured") {
+        return '<div class="rating"><span class="lbl">' + esc(label) + "</span>" +
+          '<span class="row" style="gap:10px">' + pips(Math.round(d.value * 5), 5) +
+          '<span class="n">' + Math.round(d.value * 100) + "%</span></span></div>";
+      }
+      return '<div class="rating"><span class="lbl">' + esc(label) +
+        (d.blocked_by ? '<br><span class="muted small">' + esc(d.blocked_by) + "</span>" : "") +
+        '</span><span class="chip chip-ghost">' +
+        (d.status === "not_available" ? "not available" : "not applicable") + "</span></div>";
+    }).join("") + "</div>" +
+    '<p class="small muted" style="margin-top:10px">A component that could not be measured is ' +
+    "excluded from the score rather than counted as perfect, so the number never rewards " +
+    "missing data.</p>";
   }
 
   function voiceCard(s) {

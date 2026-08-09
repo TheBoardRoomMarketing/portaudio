@@ -52,7 +52,10 @@ class JournalTestCase(unittest.TestCase):
         repo.ensure_strategy(self.conn, "DORB", "DORB")
         repo.publish_strategy_version(self.conn, "DORB", "1.0", {"entry": "range break"},
                                       automation_level="bot", active_from="2026-01-01")
-        for code in ("LATE_ENTRY", "MISSED_SETUP", "BOT_ROUTING_ERROR", "STOP_MOVED"):
+        for code in ("OVERTRADE", "REVENGE", "FOMO_ENTRY", "EARLY_ENTRY", "LATE_ENTRY",
+                     "PREMATURE_EXIT", "STOP_MOVED", "OVERSIZED", "MISSED_SETUP",
+                     "RULE_OVERRIDE", "UNPLANNED_TRADE", "DISTRACTED", "TECHNICAL_ERROR",
+                     "BOT_ROUTING_ERROR", "OTHER"):
             self.conn.execute(
                 "INSERT OR IGNORE INTO mistake_tag(code,label,category) VALUES (?,?,'process')",
                 (code, code.replace("_", " ").title()))
@@ -552,14 +555,21 @@ class TestProcessIndex(JournalTestCase):
         self.assertGreater(rows[winning]["total_r"], 0)
         self.assertLess(rows[winning]["self_reported_process_index"], 45)
 
-    def test_the_mechanical_index_is_null_until_it_is_computed(self):
+    def test_the_two_indices_are_stored_in_separate_columns(self):
+        """They are computed from different evidence and must stay separable.
+        Detailed conformance behaviour is covered in tests/test_phase3.py."""
         sid = self.make_session()
+        self.make_trade(sid)
         repo.save_checkin_post(self.conn, sid, {"execution_quality": 4, "rule_adherence": 4,
                                                 "patience": 4, "emotional_control": 4})
         metrics.recompute_all(self.conn)
-        self.assertIsNone(self.conn.execute(
-            "SELECT mechanical_conformance_index FROM session_metrics WHERE session_id=?",
-            (sid,)).fetchone()["mechanical_conformance_index"])
+        row = self.conn.execute(
+            "SELECT self_reported_process_index, mechanical_conformance_index, "
+            "conformance_index_version FROM session_metrics WHERE session_id=?",
+            (sid,)).fetchone()
+        self.assertIsNotNone(row["self_reported_process_index"])
+        self.assertIsNotNone(row["mechanical_conformance_index"])
+        self.assertEqual(row["conformance_index_version"], "mci@1.0.0")
 
 
 # =============================================================================
@@ -780,7 +790,7 @@ class TestBackupRestore(JournalTestCase):
         manifest = backup.read_manifest(archive)
         self.assertEqual(manifest["row_counts"]["trade"], 1)
         self.assertIn(backup.SNAPSHOT_NAME, manifest["files"])
-        self.assertTrue(manifest["schema"]["current"].startswith("0003"))
+        self.assertEqual(manifest["schema"]["current"], db.migration_files()[-1].name)
 
     def test_pruning_keeps_the_most_recent_archives(self):
         sid = self.make_session()
@@ -832,7 +842,8 @@ class TestMigrationUpgradePath(unittest.TestCase):
 
         upgrade = db.connect(self.db_path, restricted=False)
         applied = db.migrate(upgrade)
-        self.assertEqual(applied, ["0003_phase2_foundation.sql"])
+        self.assertEqual(applied, ["0003_phase2_foundation.sql", "0004_phase3_conformance.sql"],
+                         "every migration after the recorded point should apply, in order")
 
         session = upgrade.execute("SELECT * FROM session WHERE id=1").fetchone()
         self.assertEqual(session["session_date"], "2026-08-07")

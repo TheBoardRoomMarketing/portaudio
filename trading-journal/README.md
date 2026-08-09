@@ -41,6 +41,10 @@ in a browser — a single self-contained file with synthetic data, built by
 | `journal restore <archive>` | restore from an archive |
 | `journal verify [archive]` | check an archive, or the live database |
 | `journal recompute` | rebuild every derived metric |
+| `journal weekly` | descriptive weekly report |
+| `journal friction` | how much the journal costs to use |
+| `journal review` | the real-use checkpoint report |
+| `journal enrich-blinded` | run a blinded research enricher (storage only) |
 | `journal contracts` | what is integrated and what is still blocked |
 
 ## Layout
@@ -100,13 +104,32 @@ never fired is visible rather than merely absent.
 python3 -m unittest discover -s tests -v
 ```
 
-66 tests covering raw immutability, foreign keys, duplicate imports, strategy
+95 tests covering raw immutability, foreign keys, duplicate imports, strategy
 version preservation, check-in amendment history, transcript immutability, AI
 annotations staying non-canonical, blinded isolation, timezone handling, import
 provenance, R and fee arithmetic, slippage sign convention, export round trips,
-backup restore, and the migration upgrade path.
+backup restore, the migration upgrade path, conformance-index composition,
+descriptive-report guards and blinded enrichment provenance.
+
+## Two process views
+
+The journal reports process twice and never merges the two:
+
+- **How I felt I traded** — `self_reported_process_index`, from your four
+  evening ratings and the plan you set. Consistency, not objective quality.
+- **What the record shows** — `mechanical_conformance_index`, counted from
+  setups taken, rule violations, size discipline, overrides, stop discipline
+  and whether you traded inside your declared window.
+
+A component that cannot be measured is excluded from the score rather than
+counted as perfect, and each session records which components were in it. When
+the two views disagree the interface says so and nothing more — a difference is
+information about the relationship between self-perception and record, not a
+verdict on either.
 
 ## Documentation
 
-`docs/` holds the specification. Start with `docs/00-product-requirements.md`;
-`docs/PHASE-2-RETURN.md` describes what the current build does and does not do.
+`docs/` holds the specification. Start with `docs/00-product-requirements.md`.
+To get this running on your own machine, follow
+`docs/PHASE-3-LOCAL-RUNBOOK.md`. `docs/PHASE-3-RETURN.md` describes what the
+current build does and does not do.

@@ -21,7 +21,7 @@ import sqlite3
 from datetime import datetime
 from typing import Optional
 
-from . import config
+from . import config, conformance
 from .db import sha256_text, utcnow
 
 # The self-reported index weights. Four of five inputs are self-reported, which
@@ -231,11 +231,9 @@ def recompute_session_metrics(conn, run_id: int) -> int:
              round(mechanical, 2) if mechanical is not None else None,
              user_value_added,
              self_reported_process_index(post, mistakes),
-             # MECHANICAL_CONFORMANCE_INDEX is authorised but not computed in this
-             # phase: one of its inputs (entry deviation against rule-defined
-             # intended entry) requires the 10AM reference implementation, which
-             # is BLOCKED_ON_STRATEGY_SPEC. A partial index would read as the
-             # real one, so the column stays NULL. See docs/11-phase-2-notes.md.
+             # MECHANICAL_CONFORMANCE_INDEX_V1 is written immediately after this
+             # row exists, by recompute_conformance(); it reads the size
+             # deviation these rows produce. Entry deviation stays declared-missing.
              None,
              post["rule_adherence"] if post else None,
              mistakes, config.CALC_VERSION, run_id, utcnow()),
@@ -256,22 +254,35 @@ def recompute_all(conn, note: str = "") -> dict:
     run_id = cur.lastrowid
     trades = recompute_trade_metrics(conn, run_id)
     sessions = recompute_session_metrics(conn, run_id)
+    conformance_written = recompute_conformance(conn)
     conn.execute("UPDATE derived_run SET finished_at=?, rows_written=? WHERE id=?",
                  (utcnow(), trades + sessions, run_id))
     conn.commit()
     return {"run_id": run_id, "calc_version": config.CALC_VERSION,
-            "trade_metrics": trades, "session_metrics": sessions}
+            "trade_metrics": trades, "session_metrics": sessions,
+            "conformance": conformance_written,
+            "conformance_version": conformance.INDEX_VERSION}
+
+
+def recompute_conformance(conn) -> int:
+    """Second process view. Runs after session_metrics because it reads the
+    derived size deviation those rows produced."""
+    written = 0
+    for row in conn.execute("SELECT session_id FROM session_metrics").fetchall():
+        conformance.store(conn, row["session_id"], conformance.compute(conn, row["session_id"]))
+        written += 1
+    return written
 
 
 # Which MECHANICAL_CONFORMANCE_INDEX inputs the journal can already count, and
 # which are waiting on something. Surfaced by `journal status` so the gap is
 # visible rather than remembered.
 CONFORMANCE_INPUT_READINESS = {
-    "qualified_setups_missed": "available",
-    "rule_violations": "available",
-    "size_deviation": "available",
-    "unauthorized_overrides": "available",
-    "trading_outside_planned_window": "available",
-    "stop_rule_violations": "available",
-    "entry_deviation_vs_rule_defined_entry": "blocked: needs 10AM reference implementation",
+    "qualified_setups_taken": "implemented",
+    "rule_violations": "implemented",
+    "size_discipline": "implemented",
+    "override_discipline": "implemented",
+    "stop_discipline": "implemented",
+    "session_window": "implemented",
+    "entry_deviation": "blocked: needs 10AM reference implementation",
 }

@@ -152,7 +152,9 @@ def get_or_create_session(conn, session_date: str, *, account_id: int,
                           planned_max_risk_r: Optional[float] = None,
                           planned_max_loss: Optional[float] = None,
                           daily_loss_limit: Optional[float] = None,
-                          max_trades_planned: Optional[int] = None) -> int:
+                          max_trades_planned: Optional[int] = None,
+                          window_start: Optional[str] = None,
+                          window_end: Optional[str] = None) -> int:
     row = conn.execute(
         "SELECT id FROM session WHERE session_date=? AND session_kind=? AND account_id=?",
         (session_date, session_kind, account_id),
@@ -162,14 +164,16 @@ def get_or_create_session(conn, session_date: str, *, account_id: int,
 
     label = conn.execute("SELECT label FROM account WHERE id=?", (account_id,)).fetchone()["label"]
     uid = f"{session_date}:{session_kind}:{label.replace(' ', '_')}"
+    default_start, default_end = config.SESSION_WINDOWS.get(session_kind, (None, None))
     now = utcnow()
     cur = conn.execute(
         "INSERT INTO session(session_uid,session_date,session_kind,tz,account_id,mode,status,"
         "planned_max_risk_r,planned_max_loss,daily_loss_limit,max_trades_planned,"
-        "iso_week,iso_month,created_at,updated_at)"
-        " VALUES (?,?,?,?,?,?,'planned',?,?,?,?,?,?,?,?)",
+        "planned_window_start,planned_window_end,iso_week,iso_month,created_at,updated_at)"
+        " VALUES (?,?,?,?,?,?,'planned',?,?,?,?,?,?,?,?,?,?)",
         (uid, session_date, session_kind, tz, account_id, mode, planned_max_risk_r,
          planned_max_loss, daily_loss_limit, max_trades_planned,
+         window_start or default_start, window_end or default_end,
          iso_week_of(session_date), session_date[:7], now, now),
     )
     return cur.lastrowid
@@ -184,14 +188,14 @@ CHECKIN_PRE_FIELDS = (
     "sleep_hours", "energy", "focus", "stress", "desire_to_trade",
     "sleep_quality", "irritability", "impulsivity", "confidence", "money_pressure",
     "physical_state", "caffeine_mg", "life_stress_note", "bias", "planned_note",
-    "well_traded_definition", "note", "fill_seconds",
+    "well_traded_definition", "note", "fill_seconds", "optional_opened",
 )
 
 CHECKIN_POST_FIELDS = (
     "execution_quality", "rule_adherence", "patience", "emotional_control",
     "overtraded", "revenge_trade", "stop_moved", "oversized", "missed_qualified",
     "manual_override", "best_decision", "biggest_mistake", "unusual_context",
-    "well_traded", "note", "fill_seconds",
+    "well_traded", "note", "fill_seconds", "optional_opened",
 )
 
 
