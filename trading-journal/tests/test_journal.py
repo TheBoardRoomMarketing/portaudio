@@ -842,7 +842,9 @@ class TestMigrationUpgradePath(unittest.TestCase):
 
         upgrade = db.connect(self.db_path, restricted=False)
         applied = db.migrate(upgrade)
-        self.assertEqual(applied, ["0003_phase2_foundation.sql", "0004_phase3_conformance.sql"],
+        expected = [p.name for p in db.migration_files()
+                    if p.name > "0002_research_views.sql"]
+        self.assertEqual(applied, expected,
                          "every migration after the recorded point should apply, in order")
 
         session = upgrade.execute("SELECT * FROM session WHERE id=1").fetchone()

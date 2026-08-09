@@ -485,6 +485,8 @@ def reject_suggestion(conn, annotation_id: int) -> None:
 
 
 def add_voice_note(conn, *, session_id: Optional[int] = None, trade_id: Optional[int] = None,
+                   logical_trade_id: Optional[int] = None,
+                   trading_day_id: Optional[int] = None,
                    audio_path: str, audio_sha256: str, duration_seconds: Optional[float] = None,
                    recorded_at: Optional[str] = None, transcript: Optional[str] = None,
                    transcript_engine: Optional[str] = None,
@@ -495,10 +497,11 @@ def add_voice_note(conn, *, session_id: Optional[int] = None, trade_id: Optional
     absent transcription still leaves the human record intact.
     """
     cur = conn.execute(
-        "INSERT INTO voice_note(session_id,trade_id,recorded_at,audio_path,audio_sha256,"
-        "duration_seconds,transcript,transcript_engine,transcript_version,transcript_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (session_id, trade_id, recorded_at or utcnow(), audio_path, audio_sha256,
+        "INSERT INTO voice_note(session_id,trade_id,logical_trade_id,trading_day_id,"
+        "recorded_at,audio_path,audio_sha256,duration_seconds,transcript,transcript_engine,"
+        "transcript_version,transcript_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, trade_id, logical_trade_id, trading_day_id,
+         recorded_at or utcnow(), audio_path, audio_sha256,
          duration_seconds, transcript, transcript_engine, transcript_version,
          utcnow() if transcript else None),
     )
@@ -635,6 +638,108 @@ def journal_payload(conn) -> dict:
         "accounts": _rows(conn, "SELECT id,label,broker,mode,tz FROM account WHERE active=1"),
         "instruments": _rows(conn, "SELECT id,symbol,tick_size,point_value FROM instrument"),
         "coverage": coverage_report(conn),
+    }
+
+
+def day_journal_payload(conn) -> dict:
+    """Everything the interface reads, in one round trip.
+
+    Built around the real object model: a trading day holds a morning read and
+    logical trades; a logical trade holds execution events across every account
+    that participated. Account executions are never presented as trades.
+    """
+    from . import trades as trades_mod
+
+    days = []
+    for d in _rows(conn, "SELECT * FROM trading_day ORDER BY day_date DESC LIMIT 90"):
+        day_id = d["id"]
+        bias_row = _one(conn, "SELECT * FROM daily_bias WHERE trading_day_id=?", day_id)
+        if bias_row:
+            bias_row["sources"] = json.loads(bias_row["sources"] or "[]")
+            bias_row["amendments"] = _rows(
+                conn, "SELECT field,old_value,new_value,reason,amended_at FROM bias_amendment "
+                      "WHERE daily_bias_id=? ORDER BY amended_at", bias_row["id"])
+
+        trade_rows = _rows(conn, "SELECT * FROM v_trade_inbox WHERE day_date=? "
+                                 "ORDER BY opened_at", d["day_date"])
+        for t in trade_rows:
+            tid = t["logical_trade_id"]
+            t["timeline"] = trades_mod.position_timeline(conn, tid)
+            t["accounts"] = _rows(
+                conn, "SELECT ae.*, a.label AS account_label FROM account_execution ae "
+                      "JOIN account a ON a.id=ae.account_id WHERE ae.logical_trade_id=? "
+                      "ORDER BY CASE WHEN ae.role_at_time=\'LEAD\' THEN 0 ELSE 1 END, a.label",
+                tid)
+            for acc in t["accounts"]:
+                acc["discrepancies"] = json.loads(acc["discrepancies"] or "[]")
+            t["events"] = _rows(
+                conn, "SELECT e.*, a.label AS account_label FROM execution_event e "
+                      "JOIN account a ON a.id=e.account_id WHERE e.logical_trade_id=? "
+                      "ORDER BY e.occurred_at, e.id", tid)
+            t["voice"] = _rows(conn, "SELECT recorded_at,duration_seconds,transcript "
+                                     "FROM voice_note WHERE logical_trade_id=?", tid)
+            t["media"] = _rows(conn, "SELECT phase,timeframe,path,captured_at "
+                                     "FROM media_asset WHERE logical_trade_id=?", tid)
+            t["context_tags"] = [r["context_tag_id"] for r in conn.execute(
+                "SELECT context_tag_id FROM trade_context_tag WHERE logical_trade_id=?", (tid,))]
+            t["process_tags"] = _rows(
+                conn, "SELECT m.code,m.label,m.polarity FROM trade_process_tag tp "
+                      "JOIN mistake_tag m ON m.code=tp.tag_code WHERE tp.logical_trade_id=?", tid)
+            annotation = _one(conn, "SELECT * FROM trade_annotation WHERE logical_trade_id=?", tid)
+            if annotation:
+                t.update({k: v for k, v in annotation.items() if k != "logical_trade_id"})
+
+        summary = _one(conn, "SELECT * FROM v_day_summary WHERE trading_day_id=?", day_id) or {}
+        days.append({
+            "trading_day_id": day_id,
+            "day_date": d["day_date"],
+            "tz": d["tz"],
+            "status": d["status"],
+            "iso_week": d["iso_week"],
+            "went_well": d["went_well"],
+            "went_poorly": d["went_poorly"],
+            "lesson": d["lesson"],
+            "is_demo": d["is_demo"],
+            "bias": bias_row,
+            "trades": trade_rows,
+            "lead_pnl": summary.get("lead_pnl"),
+            "total_pnl": summary.get("total_pnl"),
+            "normalized_pnl": summary.get("normalized_pnl"),
+            "accounts": conn.execute(
+                "SELECT COUNT(*) c FROM account WHERE status=\'ACTIVE\' AND is_demo=?",
+                (d["is_demo"],)).fetchone()["c"],
+        })
+
+    demo_rows = sum(r["demo_rows"] for r in conn.execute("SELECT * FROM v_demo_isolation"))
+    return {
+        "meta": {
+            "generated_at": utcnow(),
+            "today": days[0]["day_date"] if days else utcnow()[:10],
+            "calc_version": config.CALC_VERSION,
+            "demo_rows": demo_rows,
+            "source": "live",
+        },
+        "days": days,
+    }
+
+
+def taxonomy_payload(conn) -> dict:
+    from . import adapters
+    return {
+        "setups": _rows(conn, "SELECT id,name,description FROM setup WHERE active=1 "
+                              "ORDER BY sort_order"),
+        "context_tags": _rows(conn, "SELECT id,name,kind FROM context_tag WHERE active=1 "
+                                    "ORDER BY sort_order"),
+        "process_tags": _rows(conn, "SELECT code,label,polarity,category FROM mistake_tag "
+                                    "WHERE active=1 ORDER BY polarity DESC, sort_order"),
+        "accounts": _rows(conn, "SELECT id,label,role,platform,broker,prop_firm,account_size,"
+                                "size_multiplier,status FROM account ORDER BY "
+                                "CASE role WHEN \'LEAD\' THEN 0 WHEN \'FOLLOWER\' THEN 1 "
+                                "ELSE 2 END, label"),
+        "instruments": _rows(conn, "SELECT id,symbol,tick_size,point_value FROM instrument"),
+        "adapters": adapters.status_report(),
+        "bias_directions": ["BULLISH", "BEARISH", "NEUTRAL", "UNSURE"],
+        "research_mode_enabled": False,
     }
 
 

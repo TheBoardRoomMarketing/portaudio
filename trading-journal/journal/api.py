@@ -23,7 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import backup, config, contracts, db, importers, metrics, repo
+from . import (backup, bias as bias_mod, config, contracts, db, importers,
+               metrics, repo, trades as trades_mod)
 
 _LOCK = threading.Lock()
 
@@ -138,6 +139,8 @@ class JournalHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/journal":
                 return self._json(repo.journal_payload(conn))
+            if path == "/api/day-journal":
+                return self._json(repo.day_journal_payload(conn))
             if path == "/api/meta":
                 return self._json(self._meta(conn))
             if path == "/api/status":
@@ -149,6 +152,14 @@ class JournalHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _meta(self, conn) -> dict:
+        # Legacy first, then the real-workflow taxonomy on top: the newer
+        # account rows carry role and copy relationship, which the old query
+        # does not, and the interface needs those.
+        payload = dict(self._legacy_meta(conn))
+        payload.update(repo.taxonomy_payload(conn))
+        return payload
+
+    def _legacy_meta(self, conn) -> dict:
         return {
             "schema": db.schema_state(conn),
             "calc_version": config.CALC_VERSION,
@@ -242,6 +253,30 @@ class JournalHandler(BaseHTTPRequestHandler):
             repo.reject_suggestion(conn, int(payload["annotation_id"]))
             return {"ok": True}
 
+        if path == "/api/bias":
+            day_id = _trading_day_id(conn, payload.get("date"))
+            bias_id = bias_mod.record(
+                conn, day_id, direction=payload["direction"],
+                strength=payload.get("strength"), thesis=payload.get("thesis"),
+                invalidation=payload.get("invalidation"), sources=payload.get("sources"),
+                capture_seconds=payload.get("capture_seconds"))
+            return {"trading_day_id": day_id, "daily_bias_id": bias_id}
+
+        if path == "/api/bias/amend":
+            day_id = _trading_day_id(conn, payload.get("date"))
+            return bias_mod.amend(conn, day_id, payload["changes"], payload["reason"])
+
+        if path == "/api/review":
+            return trades_mod.submit_review(conn, int(payload["logical_trade_id"]), payload)
+
+        if path == "/api/regroup":
+            return trades_mod.regroup(conn, int(payload["logical_trade_id"]),
+                                      payload["action"], payload.get("note", ""))
+
+        if path == "/api/group":
+            day_id = _trading_day_id(conn, payload.get("date"))
+            return trades_mod.group_events(conn, day_id)
+
         if path == "/api/recompute":
             return metrics.recompute_all(conn, note="manual")
 
@@ -253,6 +288,22 @@ class JournalHandler(BaseHTTPRequestHandler):
             return {"archive": str(archive), "verified": backup.verify(archive)["ok"]}
 
         raise KeyError(f"no route {path}")
+
+
+def _trading_day_id(conn, date: str) -> int:
+    """Find or create the trading day. A day exists as soon as anything is said
+    about it, including a day on which nothing was traded."""
+    if not date:
+        raise ValueError("a date is required")
+    row = conn.execute("SELECT id FROM trading_day WHERE day_date=? AND is_demo=0",
+                       (date,)).fetchone()
+    if row:
+        return row["id"]
+    now = db.utcnow()
+    return conn.execute(
+        "INSERT INTO trading_day(day_date,tz,status,iso_week,iso_month,created_at,updated_at,"
+        "is_demo) VALUES (?,?,'BIAS_MISSING',?,?,?,?,0)",
+        (date, config.DEFAULT_TZ, repo.iso_week_of(date), date[:7], now, now)).lastrowid
 
 
 def _default_account(conn) -> str:
