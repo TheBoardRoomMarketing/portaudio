@@ -64,6 +64,16 @@ SERVER_PORT = int(os.environ.get("JOURNAL_PORT", "8765"))
 # so nobody ends up with archives they cannot open because a setting drifted.
 BACKUP_ENCRYPT = os.environ.get("JOURNAL_BACKUP_ENCRYPT", "auto")
 
+# Where the backup encryption key lives: "auto" uses the macOS Keychain when it
+# is available and a 0600 key file otherwise, which is the right default.
+#
+# It is overridable because the Keychain is per-USER, not per-data-directory.
+# Two journals under different JOURNAL_HOME values would share one Keychain
+# entry, and — the reason this exists — a test suite that created a key would
+# write into the developer's real login keychain and leave it there. Tests pin
+# this to "file" so everything stays inside their temporary directory.
+KEY_BACKEND = os.environ.get("JOURNAL_KEY_BACKEND", "auto")
+
 
 def ensure_dirs() -> None:
     for d in RUNTIME_DIRS:

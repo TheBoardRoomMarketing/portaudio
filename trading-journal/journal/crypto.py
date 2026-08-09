@@ -118,6 +118,22 @@ def _file_set(key: bytes) -> None:
 
 # --------------------------------------------------------------------- key API
 def key_source() -> str:
+    """Which store holds the key.
+
+    Read from config on every call rather than cached, because the Keychain is
+    scoped to the user while everything else here is scoped to the data
+    directory — so this has to be overridable, and an override that only took
+    effect at import time would be a trap.
+    """
+    backend = getattr(config, "KEY_BACKEND", "auto")
+    if backend == "file":
+        return "file"
+    if backend == "keychain":
+        if not _keychain_available():
+            raise KeyError_(
+                "JOURNAL_KEY_BACKEND=keychain but the macOS Keychain is not available "
+                "on this machine. Use 'file' or 'auto'.")
+        return "keychain"
     return "keychain" if _keychain_available() else "file"
 
 

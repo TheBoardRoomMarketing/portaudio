@@ -32,7 +32,13 @@ class JournalTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         home = Path(self._tmp.name)
         self._saved = {k: getattr(config, k) for k in
-                       ("DATA_HOME", "DB_PATH", "RAW_DIR", "MEDIA_DIR", "BACKUP_DIR", "EXPORT_DIR")}
+                       ("DATA_HOME", "DB_PATH", "RAW_DIR", "MEDIA_DIR", "BACKUP_DIR",
+                        "EXPORT_DIR", "KEY_BACKEND")}
+        # Every test writes inside its own temporary directory and nowhere else.
+        # The macOS Keychain is scoped to the user, not the directory, so left on
+        # "auto" a test that creates a key would write into the developer's real
+        # login keychain — and the next test expecting no key would then find one.
+        config.KEY_BACKEND = "file"
         config.DATA_HOME = home
         config.DB_PATH = home / "journal.db"
         config.RAW_DIR = home / "raw"

@@ -158,11 +158,30 @@ class TestBackupEncryption(WorkflowTestCase):
         self.assertEqual(crypto.get_key(create=False), created)
 
     def test_the_key_file_is_not_readable_by_others(self):
-        if crypto.key_source() != "file":
-            self.skipTest("keychain-backed on this machine")
         crypto.get_key(create=True)
         mode = crypto._key_file_path().stat().st_mode & 0o777
         self.assertEqual(mode & 0o077, 0, f"key file is mode {mode:o}")
+
+    def test_tests_never_touch_the_real_keychain(self):
+        """The Keychain is scoped to the user, not to the data directory. Left on
+        "auto", the first test to create a key would write into the developer's
+        real login keychain and stay there — and every later test expecting no
+        key would then find one. That is exactly how this suite passed on Linux
+        and failed on macOS.
+        """
+        self.assertEqual(config.KEY_BACKEND, "file")
+        self.assertEqual(crypto.key_source(), "file")
+
+        crypto.get_key(create=True)
+        # The key landed inside this test's temporary directory and nowhere else.
+        self.assertTrue(crypto._key_file_path().exists())
+        self.assertEqual(crypto._key_file_path().parent, Path(config.DATA_HOME))
+
+    def test_a_fresh_data_home_starts_with_no_key(self):
+        """The property the macOS failure violated: a brand new journal has no
+        key, so its first backup is plain until someone opts in."""
+        self.assertIsNone(crypto.get_key(create=False))
+        self.assertFalse(backup.is_encrypted(backup.create(self.conn, label="first")))
 
     def test_key_status_never_reveals_the_key(self):
         key = crypto.get_key(create=True)
@@ -336,10 +355,15 @@ class TestAccessEnforcement(WorkflowTestCase):
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}",
                                          headers=headers or {})
         try:
-            response = (opener or urllib.request.urlopen)(request)
-            return response.status, response.headers.get("Set-Cookie")
+            with (opener or urllib.request.urlopen)(request) as response:
+                return response.status, response.headers.get("Set-Cookie")
         except urllib.error.HTTPError as exc:
-            return exc.code, None
+            # An HTTPError is itself an open response. Closing it keeps the test
+            # output free of ResourceWarnings, which otherwise bury real failures.
+            try:
+                return exc.code, None
+            finally:
+                exc.close()
 
     def test_an_unauthenticated_request_is_refused(self):
         self.assertEqual(self.get("/api/health")[0], 401)
@@ -360,7 +384,8 @@ class TestAccessEnforcement(WorkflowTestCase):
             headers={"Content-Type": "application/json"})
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(request)
-        self.assertEqual(ctx.exception.code, 401)
+        with ctx.exception as error:
+            self.assertEqual(error.code, 401)
 
     def test_a_valid_token_works_and_is_swapped_for_a_cookie(self):
         status, cookie = self.get(f"/api/health?t={self.token}")
@@ -379,7 +404,8 @@ class TestAccessEnforcement(WorkflowTestCase):
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/health")
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(request)
-        body = ctx.exception.read().decode()
+        with ctx.exception as error:
+            body = error.read().decode()
         self.assertNotIn(self.token, body)
         self.assertNotIn(str(len(self.token)), body)
 
