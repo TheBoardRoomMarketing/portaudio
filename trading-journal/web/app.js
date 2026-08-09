@@ -10,8 +10,10 @@
 (function () {
   "use strict";
 
-  var D = window.JOURNAL;
+  var D = null;                       // journal payload, loaded in boot()
+  var META = null;                    // taxonomy, strategies, integration status
   var ET_OFFSET_MS = 4 * 3600 * 1000; // stored UTC -> America/New_York wall clock (EDT)
+  var LIVE = false;                   // true when talking to the local server
 
   /* ------------------------------------------------------------------ format */
   var MONTHS = ["January", "February", "March", "April", "May", "June", "July",
@@ -95,18 +97,27 @@
   }
 
   /* ------------------------------------------------------------------ data access */
-  var SESSIONS = D.sessions.slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
-  var BY_DATE = {};
-  var TRADES = [];
-  SESSIONS.forEach(function (s) {
-    BY_DATE[s.date] = s;
-    s.trades.forEach(function (t) { t._session = s; TRADES.push(t); });
-  });
-  var TRADE_BY_UID = {};
-  TRADES.forEach(function (t) { TRADE_BY_UID[t.trade_uid] = t; });
-  var TODAY = D.meta.today;
-  var TAXONOMY = {};
-  D.mistake_taxonomy.forEach(function (m) { TAXONOMY[m.code] = m; });
+  var SESSIONS = [], BY_DATE = {}, TRADES = [], TRADE_BY_UID = {}, TODAY = null, TAXONOMY = {};
+
+  function buildIndexes() {
+    SESSIONS = D.sessions.slice().sort(function (a, b) {
+      return (a.date + a.session_kind) < (b.date + b.session_kind) ? -1 : 1;
+    });
+    BY_DATE = {}; TRADES = []; TRADE_BY_UID = {}; TAXONOMY = {};
+    SESSIONS.forEach(function (s) {
+      // A date may hold several sessions (NY_AM / NY_PM / OVERNIGHT). The
+      // calendar and Today screen aggregate them; BY_DATE keeps the first.
+      if (!BY_DATE[s.date]) BY_DATE[s.date] = s;
+      s.trades.forEach(function (t) { t._session = s; TRADES.push(t); });
+    });
+    TRADES.forEach(function (t) { TRADE_BY_UID[t.trade_uid] = t; });
+    TODAY = D.meta.today;
+    (D.mistake_taxonomy || []).forEach(function (m) { TAXONOMY[m.code] = m; });
+  }
+
+  function sessionsOn(date) {
+    return SESSIONS.filter(function (s) { return s.date === date; });
+  }
 
   function tagLabel(code) { return TAXONOMY[code] ? TAXONOMY[code].label : code; }
   function m(s) { return s.metrics || {}; }
@@ -145,7 +156,7 @@
       a.mech += mm.mechanical_r || 0;
       a.uva += mm.user_value_added_r || 0;
       a.mistakes += mm.mistake_count || 0;
-      if (mm.process_score != null) a.process.push(mm.process_score);
+      if (mm.self_reported_process_index != null) a.process.push(mm.self_reported_process_index);
       if (mm.rule_adherence != null) a.adherence.push(mm.rule_adherence);
       if (!mm.trade_count) a.noTrade++;
       s.trades.forEach(function (t) {
@@ -176,14 +187,14 @@
     if (score == null) return "";
     var r = 26, c = 2 * Math.PI * r, on = c * (score / 100);
     return '<div class="dial">' +
-      '<svg width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Process score ' +
+      '<svg width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Self-reported process index ' +
         fmtNum(score, 0) + ' out of 100">' +
       '<circle cx="32" cy="32" r="' + r + '" fill="none" stroke="var(--card-3)" stroke-width="5"/>' +
       '<circle cx="32" cy="32" r="' + r + '" fill="none" stroke="var(--accent)" stroke-width="5" ' +
         'stroke-linecap="round" stroke-dasharray="' + on.toFixed(1) + " " + c.toFixed(1) + '" ' +
         'transform="rotate(-90 32 32)"/></svg>' +
       '<div><div class="dial-v">' + fmtNum(score, 0) + '<span class="muted" style="font-size:13px">/100</span></div>' +
-      '<div class="dial-l">' + esc(label || "Process score") + "</div></div></div>";
+      '<div class="dial-l">' + esc(label || "Self-reported process index") + "</div></div></div>";
   }
 
   function pips(n, max, warm) {
@@ -555,9 +566,10 @@
                        : '<p class="muted">No trades taken.</p>') + "</section>" +
         oppCard(opps) + reflectionCard(s);
       right = '<section class="card"><div class="card-head"><span class="eyebrow">How the day scored</span></div>' +
-        dial(mm.process_score) +
-        '<p class="small muted" style="margin-top:12px">Process score contains no P&amp;L term. ' +
-        "It is rule adherence, execution, patience, emotional control and plan conformance.</p>" +
+        dial(mm.self_reported_process_index, "Self-reported process index") +
+        '<p class="small muted" style="margin-top:12px">Contains no P&amp;L term: rule adherence, ' +
+        "execution, patience, emotional control and plan conformance. Four of its five inputs " +
+        "are your own ratings, so it measures consistency, not objective quality.</p>" +
         '<hr class="divider" style="margin:16px 0">' +
         '<div class="stack-sm">' +
           rating("Execution quality", (s.post || {}).execution_quality) +
@@ -744,16 +756,23 @@
       '<div class="stats stats-4">' +
         stat("Net P&L", fmtMoney(mm.net_pnl), outcomeWord(mm.net_pnl), cls(mm.net_pnl)) +
         stat("R", fmtR(mm.total_r), (mm.trade_count || 0) + " trades · " + (mm.win_count || 0) + " winners") +
-        stat("Process score", fmtNum(mm.process_score, 0), "no P&L in this number", "sm") +
+        stat("Process index", fmtNum(mm.self_reported_process_index, 0), "self-reported · no P&L", "sm") +
         stat("Rule adherence", (mm.rule_adherence || "—") + "/5",
              (mm.mistake_count || 0) + (mm.mistake_count === 1 ? " flag" : " flags"), "sm") +
       "</div>" +
       '<div class="stats stats-3" style="border-top:1px solid var(--rule);border-radius:0">' +
         stat("Qualified setups", String(mm.opportunities_total || 0),
              (mm.opportunities_taken || 0) + " taken · " + (mm.opportunities_missed || 0) + " missed", "sm") +
-        stat("Mechanical reference", fmtR(mm.mechanical_r), "what the rules alone produced", "sm") +
-        stat("Your difference", fmtR(mm.user_value_added_r),
-             (mm.user_value_added_r >= 0 ? "discretion added" : "discretion cost"), "sm " + cls(mm.user_value_added_r)) +
+        stat("Mechanical reference",
+             mm.mechanical_r == null ? "—" : fmtR(mm.mechanical_r),
+             mm.mechanical_r == null ? "no reference implementation yet"
+                                     : "what the rules alone produced", "sm") +
+        stat("Your difference",
+             mm.user_value_added_r == null ? "—" : fmtR(mm.user_value_added_r),
+             mm.user_value_added_r == null
+               ? "not computable until a strategy has one"
+               : (mm.user_value_added_r >= 0 ? "discretion added" : "discretion cost"),
+             "sm " + (mm.user_value_added_r == null ? "" : cls(mm.user_value_added_r))) +
       "</div></section>" +
 
       (s.narrative && s.narrative.length ? '<div style="margin-top:22px">' + narrativeCard(s) + "</div>" : "") +
@@ -768,7 +787,7 @@
         oppCard(s.opportunities) +
       "</div><div class=\"stack\">" +
         '<section class="card"><div class="card-head"><span class="eyebrow">How I traded</span></div>' +
-        dial(mm.process_score) +
+        dial(mm.self_reported_process_index, "Self-reported process index") +
         '<hr class="divider" style="margin:16px 0">' +
         '<span class="eyebrow">Before the open</span><div class="stack-sm" style="margin-bottom:14px">' +
           rating("Energy", pre.energy) + rating("Focus", pre.focus) + rating("Stress", pre.stress, true) +
@@ -950,12 +969,12 @@
       var mm = m(s), marks = [];
       if (mm.mistake_count) marks.push('<span class="mark mark-flag">' + mm.mistake_count + " flag" + (mm.mistake_count > 1 ? "s" : "") + "</span>");
       if (mm.opportunities_missed) marks.push('<span class="mark mark-watch">' + mm.opportunities_missed + " missed</span>");
-      if (!mm.mistake_count && mm.process_score >= 80) marks.push('<span class="mark mark-good">good process</span>');
+      if (!mm.mistake_count && mm.self_reported_process_index >= 80) marks.push('<span class="mark mark-good">good process</span>');
       cells += '<a class="cal-cell linked" href="#/session/' + key + '">' +
         '<span class="cal-day">' + d + " · " + DAYS[dow].slice(0, 3) + "</span>" +
         '<span class="cal-r ' + cls(mm.total_r) + '">' + (mm.trade_count ? fmtR(mm.total_r, 1) : "No trade") + "</span>" +
         '<span class="cal-tag">' + (mm.trade_count ? mm.trade_count + (mm.trade_count === 1 ? " trade" : " trades") : "Stayed out") +
-        (mm.process_score != null ? " · process " + fmtNum(mm.process_score, 0) : "") + "</span>" +
+        (mm.self_reported_process_index != null ? " · process " + fmtNum(mm.self_reported_process_index, 0) : "") + "</span>" +
         '<span class="cal-marks">' + marks.join("") + "</span></a>";
     }
 
@@ -972,7 +991,7 @@
 
       '<div class="stats stats-4" style="margin-bottom:20px">' +
         stat("Month R", fmtR(a.r), outcomeWord(a.r), cls(a.r)) +
-        stat("Process average", fmtNum(a.avgProcess, 0), "of 100", "sm") +
+        stat("Process index", fmtNum(a.avgProcess, 0), "self-reported average", "sm") +
         stat("Rule flags", String(a.mistakes), "across " + a.sessions + " sessions", "sm") +
         stat("Setups missed", String(a.missed), "of " + a.opps + " qualified", "sm") +
       "</div>" +
@@ -1027,8 +1046,8 @@
       .map(function (k) { return { label: tagLabel(k), value: mistakes[k], display: String(mistakes[k]), warm: true }; });
 
     var best = list.slice().sort(function (x, y) { return (m(y).total_r || 0) - (m(x).total_r || 0); })[0];
-    var worstProcess = list.slice().filter(function (s) { return m(s).process_score != null; })
-      .sort(function (x, y) { return (m(x).process_score || 0) - (m(y).process_score || 0); })[0];
+    var worstProcess = list.slice().filter(function (s) { return m(s).self_reported_process_index != null; })
+      .sort(function (x, y) { return (m(x).self_reported_process_index || 0) - (m(y).self_reported_process_index || 0); })[0];
 
     var focus = [];
     if (a.missed > 0) focus.push("Be at the desk for the " + (a.missed === 1 ? "one setup" : a.missed + " setups") +
@@ -1097,7 +1116,7 @@
           : '<p class="muted">No qualified setup went untaken this week.</p>') + "</section>" +
       "</div><div class=\"stack\">" +
         '<span class="eyebrow" style="margin-bottom:-6px">Process</span>' +
-        '<section class="card">' + dial(a.avgProcess, "Weekly process average") +
+        '<section class="card">' + dial(a.avgProcess, "Self-reported process index, weekly average") +
         '<div class="stack-sm" style="margin-top:14px">' +
           '<div class="rating"><span class="lbl">Rule adherence</span><span class="num">' + fmtNum(a.avgAdherence, 1) + "/5</span></div>" +
           '<div class="rating"><span class="lbl">Rule flags</span><span class="num">' + a.mistakes + "</span></div>" +
@@ -1119,7 +1138,7 @@
           '" href="#/session/' + best.date + '">' + fmtR(m(best).total_r) + "</a></div>" : "") +
         (worstProcess ? '<div class="rating"><span class="lbl">Weakest process<br><span class="muted small">' +
           esc(longDate(worstProcess.date)) + '</span></span><a class="num" href="#/session/' + worstProcess.date + '">' +
-          fmtNum(m(worstProcess).process_score, 0) + "/100</a></div>" : "") +
+          fmtNum(m(worstProcess).self_reported_process_index, 0) + "/100</a></div>" : "") +
         "</section>" +
 
         '<section class="card"><div class="card-head"><span class="eyebrow">Next week</span></div>' +
@@ -1168,7 +1187,7 @@
       '<div class="stats stats-4" style="margin-bottom:20px">' +
         stat("Month R", fmtR(a.r), outcomeWord(a.r), cls(a.r)) +
         stat("Expectancy", fmtR(a.expectancy), "per trade", "sm") +
-        stat("Process average", fmtNum(a.avgProcess, 0), "of 100", "sm") +
+        stat("Process index", fmtNum(a.avgProcess, 0), "self-reported average", "sm") +
         stat("Discretion", fmtR(a.uva), a.uva >= 0 ? "added over rules" : "cost against rules", "sm " + cls(a.uva)) +
       "</div>" +
 
@@ -1284,173 +1303,353 @@
   }
 
   /* ------------------------------------------------------------------ view: RESEARCH */
-  var researchUnlocked = false;
-
+  /* Director ruling D8: blinded features are STORED from this phase, and
+     Research Mode is NOT built or enabled. There is deliberately no unlock
+     control on this screen — the risk of building the room early is not wasted
+     work, it is the temptation to walk into it at n = 30 and see something. */
   function viewResearch() {
-    if (!researchUnlocked) {
-      return '<div class="page-head"><div class="grow">' +
-        '<span class="eyebrow">Restricted</span><h1>Research Mode</h1>' +
-        '<p class="page-sub">Blinded variables live here and nowhere else.</p></div></div>' +
-        '<div class="locked"><h2 style="margin-bottom:10px">This section is blinded on purpose</h2>' +
-        '<p class="prose" style="max-width:56ch;margin:0 auto 20px">Personal and market research features are ' +
-        "computed for every session and stored, but they are never shown during check-in, check-out or daily " +
-        "review. The point is to keep your expectations out of your own data. Opening this section writes an " +
-        "entry to the unblinding log with a timestamp and a reason.</p>" +
-        '<button class="btn btn-primary" data-unlock="1">Enter Research Mode</button>' +
-        '<p class="small muted" style="margin-top:14px">Prototype: no real features are revealed.</p></div>';
-    }
-
-    var samples = D.research.sample_sizes;
-    var prereg = D.research.preregistrations;
-    var sessionsN = SESSIONS.length;
-
     return '<div class="page-head"><div class="grow">' +
-      '<span class="eyebrow">Research Mode · unblinded session</span><h1>Research Mode</h1>' +
-      '<p class="page-sub">Opened ' + esc(D.meta.generated_at) + " · logged</p></div>" +
-      '<button class="btn" data-unlock="0">Leave and re-blind</button></div>' +
+      '<span class="eyebrow">Deferred by design</span><h1>Research Mode</h1>' +
+      '<p class="page-sub">Not built in this phase, and not openable.</p></div></div>' +
 
-      '<div class="warnband" style="margin-bottom:20px"><span class="g">n = ' + sessionsN + "</span>" +
-      "<p><b>Sample sizes here do not support conclusions.</b> With " + sessionsN + " sessions, any subgroup " +
-      "you can name has fewer than 30 observations. This screen deliberately shows counts before it shows " +
-      "effects, and it will not compute an effect for a feature below its preregistered minimum n.</p></div>" +
+      '<div class="locked"><h2 style="margin-bottom:10px">Store early. Look late.</h2>' +
+      '<p class="prose" style="max-width:58ch;margin:0 auto 18px">Research features are ' +
+      "computed and written from the day the journal is in use, so the record accumulates " +
+      "while the questions are still unasked. Reading them is a different act, and it belongs " +
+      "to a later phase — after the sample is large enough for an answer to mean anything, and " +
+      "only under a question written down in advance.</p>" +
+      '<p class="prose" style="max-width:58ch;margin:0 auto">There is no unlock button here. ' +
+      "That is the feature.</p></div>" +
 
-      '<div class="grid g-main"><div class="stack">' +
-      '<section class="card"><div class="card-head"><span class="eyebrow">Feature sets</span>' +
-      '<span class="muted small">keys are opaque by design</span></div>' +
-      '<div class="table-wrap"><table><thead><tr><th>Set</th><th>Key</th><th class="n">n</th>' +
-      '<th>Status</th><th>Label</th></tr></thead><tbody>' +
-      samples.map(function (r) {
-        return "<tr><td>" + esc(r.feature_set) + '</td><td class="num">' + esc(r.feature_key) + "</td>" +
-          '<td class="n">' + r.n_observations + "</td><td>" +
-          '<span class="chip ' + (r.sample_status === "reportable" ? "chip-accent" :
-            r.sample_status === "provisional" ? "chip-watch" : "chip-flag") + '">' + esc(r.sample_status) + "</span></td>" +
-          '<td><span class="redacted">withheld until preregistered</span></td></tr>';
-      }).join("") + "</tbody></table></div>" +
-      '<p class="small muted" style="margin-top:12px">Feature labels are stored in a separate dictionary ' +
-      "table and are only joined under a locked preregistration. Values are visible; meanings are not.</p></section>" +
-
-      '<section class="card"><div class="card-head"><span class="eyebrow">Preregistered questions</span>' +
-      '<button class="btn" disabled style="opacity:.55;cursor:not-allowed">New question</button></div>' +
-      '<div class="stack-sm">' + prereg.map(function (p) {
-        return '<div class="reflect-item"><span class="k">' + esc(p.status) + " · min n " + p.min_n +
-          " · outcome " + esc(p.outcome_metric) + '</span><span class="t">' + esc(p.question) + "</span>" +
-          '<p class="small muted" style="margin-top:4px">' + esc(p.hypothesis) + "</p></div>";
-      }).join("") + "</div>" +
-      '<p class="small muted" style="margin-top:12px">A question must be locked before the data is looked at. ' +
-      "The lock stores a hash of the analysis plan so it cannot be edited after seeing the result.</p></section>" +
-
-      '<section class="card"><div class="card-head"><span class="eyebrow">Available analyses</span></div>' +
-      '<div class="stack-sm">' + [
-        ["Personal state vs execution quality", sessionsN, 120],
-        ["Personal state vs rule violations", sessionsN, 120],
-        ["Sleep and focus vs mistake count", sessionsN, 60],
-        ["Manual intervention vs mechanical outcome", 90, 100],
-        ["Strategy vs market regime", sessionsN, 200]
-      ].map(function (row) {
-        var ok = row[1] >= row[2];
-        return '<div class="rating"><span class="lbl">' + esc(row[0]) +
-          '<br><span class="muted small">n = ' + row[1] + " · needs " + row[2] + "</span></span>" +
-          '<span class="chip ' + (ok ? "chip-accent" : "chip-watch") + '">' +
-          (ok ? "runnable" : "under-powered") + "</span></div>";
-      }).join("") + "</div></section>" +
-      "</div><div class=\"stack\">" +
-      '<section class="card"><div class="card-head"><span class="eyebrow">Unblinding log</span></div>' +
-      '<p class="muted small">No unblinding events recorded. This prototype does not reveal features; ' +
-      "in the real system every entry into this mode is written here with actor, scope and reason.</p></section>" +
-      '<section class="card"><div class="card-head"><span class="eyebrow">Rules of this room</span></div>' +
+      '<div class="grid g-2" style="margin-top:22px">' +
+      '<section class="card"><div class="card-head"><span class="eyebrow">What is running now</span></div>' +
+      '<div class="stack-sm">' +
+      '<div class="rating"><span class="lbl">Blinded feature storage</span>' +
+      '<span class="chip chip-accent">active</span></div>' +
+      '<div class="rating"><span class="lbl">Feature keys</span>' +
+      '<span class="chip chip-ghost">opaque</span></div>' +
+      '<div class="rating"><span class="lbl">Readable from any daily view</span>' +
+      '<span class="chip chip-ghost">no</span></div>' +
+      '<div class="rating"><span class="lbl">Personal astro analysis executed</span>' +
+      '<span class="chip chip-ghost">never</span></div>' +
+      '<div class="rating"><span class="lbl">Research Mode interface</span>' +
+      '<span class="chip chip-watch">deferred</span></div>' +
+      "</div></section>" +
+      '<section class="card"><div class="card-head"><span class="eyebrow">The four locks</span></div>' +
       '<div class="reflect">' +
-      '<div class="reflect-item"><span class="k">1</span><span class="t">Questions are written down before the data is looked at.</span></div>' +
-      '<div class="reflect-item"><span class="k">2</span><span class="t">No weekly automatic slicing. Nothing here runs on a schedule.</span></div>' +
-      '<div class="reflect-item"><span class="k">3</span><span class="t">Findings below the preregistered n are not shown, not even greyed out.</span></div>' +
-      '<div class="reflect-item"><span class="k">4</span><span class="t">Nothing from this screen is ever surfaced during a trading session.</span></div>' +
-      "</div></section></div></div>";
+      '<div class="reflect-item"><span class="k">1 · separation</span><span class="t">Features live in ' +
+      "their own table. No daily view joins it.</span></div>" +
+      '<div class="reflect-item"><span class="k">2 · opacity</span><span class="t">Values are stored ' +
+      "against keys, not names. A leaked value means nothing without the dictionary.</span></div>" +
+      '<div class="reflect-item"><span class="k">3 · connection</span><span class="t">The interface\u2019s ' +
+      "database connection refuses to read the research layer at all.</span></div>" +
+      '<div class="reflect-item"><span class="k">4 · logging</span><span class="t">When the room is ' +
+      "eventually built, opening it will write an entry naming who, what and why.</span></div>" +
+      "</div></section></div>";
   }
 
-  /* ------------------------------------------------------------------ view: CAPTURE */
-  function viewCapture() {
-    return '<div class="page-head"><div class="grow">' +
-      '<span class="eyebrow">Mobile intake</span><h1>Capture</h1>' +
-      '<p class="page-sub">The two moments that have to be frictionless. Everything else in this ' +
-      "journal can be reconstructed from data; these cannot.</p></div></div>" +
+  /* ------------------------------------------------------------------ capture */
+  var CAPTURE = { tab: "morning", saved: null, error: null, busy: false };
 
-      '<div class="phones">' +
-      '<div><div class="phone"><div class="phone-screen">' +
-        '<div class="phone-status"><span>9:10</span><span>Pre-session</span></div>' +
-        '<div class="notif"><div><span class="src">Trading Journal</span>' +
-        "<p><b>Twenty minutes to the open.</b> Thirty seconds — how are you arriving today?</p></div></div>" +
-        '<div class="stack-sm">' +
-        slider("Sleep", "sleep", 6.2, 3, 10, 0.1, " h") +
-        slider("Energy", "energy", 3, 1, 5, 1, "/5") +
-        slider("Focus", "focus", 4, 1, 5, 1, "/5") +
-        slider("Stress", "stress", 2, 1, 5, 1, "/5") +
-        slider("Desire to trade", "desire", 3, 1, 5, 1, "/5") +
-        "</div>" +
-        '<div><span class="eyebrow">Bias</span><div class="seg" data-seg="bias">' +
-        ["Bullish", "Neutral", "Bearish"].map(function (b, i) {
-          return "<button aria-pressed=\"" + (i === 1) + "\">" + b + "</button>"; }).join("") + "</div></div>" +
-        '<div><span class="eyebrow">A well-traded day today means</span>' +
-        '<textarea class="note" rows="2">Only A-setups. Two trades maximum.</textarea></div>' +
-        '<details class="disclosure"><summary>More (optional)</summary>' +
-        '<div class="stack-sm">' + slider("Impulsivity", "imp", 2, 1, 5, 1, "/5") +
-        slider("Confidence", "conf", 4, 1, 5, 1, "/5") +
-        '<div class="rating"><span class="lbl">Pressure to make money</span>' +
-        '<div class="seg" data-seg="press" style="width:110px"><button aria-pressed="false">Yes</button>' +
-        '<button aria-pressed="true">No</button></div></div></div></details>' +
-        '<button class="btn btn-primary" style="justify-content:center">Save and start the day</button>' +
-        '<p class="small muted center">Median completion in the prototype: 41 seconds.</p>' +
-      "</div></div>" +
-      '<p class="phone-caption"><b>Morning.</b> Five sliders, one segmented control, one sentence. ' +
-      "Everything else is behind “More”. The one required free-text field is the definition of a " +
-      "well-traded day, because it is what the evening check-out is scored against.</p></div>" +
+  function api(path, body) {
+    if (!LIVE) {
+      return Promise.reject(new Error(
+        "This is the offline demo bundle. Run `bin/journal serve` to record real entries."));
+    }
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error(j.error || (r.status + " " + r.statusText));
+        return j;
+      });
+    });
+  }
 
-      '<div><div class="phone"><div class="phone-screen">' +
-        '<div class="phone-status"><span>16:05</span><span>Post-session</span></div>' +
-        '<div class="notif"><div><span class="src">Trading Journal</span>' +
-        "<p><b>Session closed.</b> 2 trades, 3 qualified setups. Two minutes to close the day.</p></div></div>" +
-        '<div class="stack-sm">' +
-        slider("Execution quality", "exq", 4, 1, 5, 1, "/5") +
-        slider("Rule adherence", "adh", 4, 1, 5, 1, "/5") +
-        slider("Patience", "pat", 3, 1, 5, 1, "/5") +
-        slider("Emotional control", "emo", 4, 1, 5, 1, "/5") +
-        "</div>" +
-        '<div><span class="eyebrow">Anything happen?</span><div class="checks">' +
-        ["Overtraded", "Revenge trade", "Stop moved", "Oversized", "Missed a setup", "Overrode a rule"]
-          .map(function (c, i) {
-            return '<button class="check" aria-pressed="' + (i === 4) + '"><span class="box"></span>' + c + "</button>";
-          }).join("") + "</div></div>" +
-        '<div><span class="eyebrow">Would this be a well-traded day with P&amp;L hidden?</span>' +
-        '<div class="seg" data-seg="wt">' + ["Yes", "Mixed", "No"].map(function (b, i) {
-          return "<button aria-pressed=\"" + (i === 1) + "\">" + b + "</button>"; }).join("") + "</div></div>" +
-        '<button class="mic"><span class="dot"></span><span class="t">Hold to record a voice note</span>' +
-        '<span class="num">0:48</span></button>' +
-        '<button class="btn btn-primary" style="justify-content:center">Finish session</button>' +
-        '<p class="small muted center">Best decision and biggest mistake are asked on the next card.</p>' +
-      "</div></div>" +
-      '<p class="phone-caption"><b>Evening.</b> Four ratings, six checkboxes, one verdict, one optional ' +
-      "voice note. The mistake checkboxes write straight into the taxonomy; the voice note is stored as " +
-      "audio plus verbatim transcript and is never edited by a model.</p></div>" +
+  function formValues(scope) {
+    var out = {};
+    [].forEach.call(scope.querySelectorAll("[data-field]"), function (el) {
+      var key = el.getAttribute("data-field");
+      var type = el.getAttribute("data-type") || "text";
+      var value;
+      if (el.tagName === "DIV") {                       // segmented control
+        var on = el.querySelector('[aria-pressed="true"]');
+        value = on ? on.getAttribute("data-value") : null;
+      } else if (el.classList.contains("check")) {
+        value = el.getAttribute("aria-pressed") === "true" ? 1 : 0;
+      } else {
+        value = el.value;
+      }
+      if (value === "" || value === null) return;
+      out[key] = type === "number" ? Number(value) : value;
+    });
+    return out;
+  }
+
+  function captureTabs() {
+    var tabs = [["morning", "Morning check-in"], ["evening", "Post-session"],
+                ["trade", "Log a trade"], ["setup", "Log a setup"]];
+    return '<div class="daystate" role="group" aria-label="Capture form">' +
+      tabs.map(function (t) {
+        return '<button data-captab="' + t[0] + '" aria-pressed="' + (CAPTURE.tab === t[0]) +
+          '">' + t[1] + "</button>";
+      }).join("") + "</div>";
+  }
+
+  function captureBanner() {
+    if (CAPTURE.error) {
+      return '<div class="warnband" style="margin-bottom:18px"><span class="g">not saved</span>' +
+        "<p>" + esc(CAPTURE.error) + "</p></div>";
+    }
+    if (CAPTURE.saved) {
+      return '<div class="warnband" style="margin-bottom:18px;border-color:' +
+        'color-mix(in srgb, var(--accent) 40%, transparent);background:var(--accent-wash)">' +
+        '<span class="g" style="color:var(--accent-2)">saved</span><p>' + esc(CAPTURE.saved) +
+        "</p></div>";
+    }
+    if (!LIVE) {
+      return '<div class="warnband" style="margin-bottom:18px"><span class="g">demo</span>' +
+        "<p>This is the offline bundle, so the forms below will not save. " +
+        "Run <span class=\"num\">bin/journal serve</span> to use the journal for real.</p></div>";
+    }
+    return "";
+  }
+
+  function todayField() {
+    var kinds = (META && META.session_kinds) || ["NY_AM", "NY_PM", "OVERNIGHT", "OTHER"];
+    return '<div class="grid g-2" style="gap:14px;margin-bottom:16px">' +
+      '<div class="slider-row"><span class="lbl">Date</span>' +
+      '<input class="note" type="date" data-field="date" value="' + esc(TODAY) + '"></div>' +
+      '<div class="slider-row"><span class="lbl">Session</span>' +
+      '<select class="note" data-field="session_kind">' + kinds.map(function (k) {
+        return '<option value="' + k + '"' + (k === "NY_AM" ? " selected" : "") + ">" +
+          k.replace("_", " ") + "</option>";
+      }).join("") + "</select></div></div>";
+  }
+
+  function seg(field, options, selected) {
+    return '<div class="seg" data-field="' + field + '" data-seg>' + options.map(function (o) {
+      var value = typeof o === "string" ? o : o[0];
+      var label = typeof o === "string" ? o : o[1];
+      return '<button type="button" data-value="' + esc(value) + '" aria-pressed="' +
+        (value === selected) + '">' + esc(label) + "</button>";
+    }).join("") + "</div>";
+  }
+
+  function morningForm() {
+    return '<section class="card" id="capture-form">' +
+      '<div class="card-head"><span class="eyebrow">Morning check-in</span>' +
+      '<span class="muted small">seven fields · under a minute</span></div>' +
+      todayField() +
+      '<div class="stack-sm">' +
+      sliderField("Sleep", "sleep_hours", 7, 3, 10, 0.1, " h") +
+      sliderField("Energy", "energy", 4, 1, 5, 1, "/5") +
+      sliderField("Focus", "focus", 4, 1, 5, 1, "/5") +
+      sliderField("Stress", "stress", 2, 1, 5, 1, "/5") +
+      sliderField("Desire to trade", "desire_to_trade", 3, 1, 5, 1, "/5") +
       "</div>" +
-
-      '<section class="card" style="margin-top:28px"><div class="card-head">' +
-      '<span class="eyebrow">How the prompt arrives</span></div>' +
-      '<div class="grid g-3">' +
-      ["A scheduled job on your machine (launchd / cron / Task Scheduler) fires at 09:10 and 16:05 ET " +
-       "and posts a notification. Nothing needs to be running or watching.",
-       "The notification opens the local web app straight onto the form for that session — no navigation, " +
-       "no login, no picking a date.",
-       "If a check-in is skipped, the session is still created and marked incomplete. Missing data is " +
-       "recorded as missing, never back-filled from memory a week later."
-      ].map(function (t, i) {
-        return '<div class="reflect-item"><span class="k">Step ' + (i + 1) + '</span><span class="t" ' +
-          'style="font-size:14.5px">' + esc(t) + "</span></div>";
-      }).join("") + "</div></section>";
+      '<div style="margin-top:16px"><span class="eyebrow">Directional bias</span>' +
+      seg("bias", [["bullish", "Bullish"], ["neutral", "Neutral"], ["bearish", "Bearish"]],
+          "neutral") + "</div>" +
+      '<div style="margin-top:16px"><span class="eyebrow">What would make today a well-traded ' +
+      'day if P&amp;L were hidden?</span>' +
+      '<textarea class="note" rows="2" data-field="well_traded_definition" ' +
+      'placeholder="Only A-setups. Two trades maximum."></textarea></div>' +
+      '<details class="disclosure"><summary>More (optional)</summary><div class="stack-sm">' +
+      sliderField("Sleep quality", "sleep_quality", 3, 1, 5, 1, "/5") +
+      sliderField("Impulsivity", "impulsivity", 2, 1, 5, 1, "/5") +
+      sliderField("Confidence", "confidence", 3, 1, 5, 1, "/5") +
+      sliderField("Irritability", "irritability", 2, 1, 5, 1, "/5") +
+      '<div style="margin-top:6px"><span class="eyebrow">Pressure to make money</span>' +
+      seg("money_pressure", [["1", "Yes"], ["0", "No"]], "0") + "</div>" +
+      '<div style="margin-top:6px"><span class="eyebrow">Note</span>' +
+      '<textarea class="note" rows="2" data-field="note"></textarea></div>' +
+      "</div></details>" +
+      '<button class="btn btn-primary" data-submit="pre" style="margin-top:16px">' +
+      "Save and start the day</button>" +
+      '<p class="small muted" style="margin-top:10px">Editing a saved check-in does not ' +
+      "overwrite it — the previous answer is kept as an amendment with a timestamp.</p></section>";
   }
 
-  function slider(label, id, value, min, max, step, unit) {
+  function eveningForm() {
+    var flags = [["overtraded", "Overtraded"], ["revenge_trade", "Revenge trade"],
+                 ["stop_moved", "Stop moved"], ["oversized", "Oversized"],
+                 ["missed_qualified", "Missed a setup"], ["manual_override", "Overrode a rule"]];
+    return '<section class="card" id="capture-form">' +
+      '<div class="card-head"><span class="eyebrow">Post-session check-out</span>' +
+      '<span class="muted small">under two minutes</span></div>' +
+      todayField() +
+      '<div class="stack-sm">' +
+      sliderField("Execution quality", "execution_quality", 4, 1, 5, 1, "/5") +
+      sliderField("Rule adherence", "rule_adherence", 4, 1, 5, 1, "/5") +
+      sliderField("Patience", "patience", 4, 1, 5, 1, "/5") +
+      sliderField("Emotional control", "emotional_control", 4, 1, 5, 1, "/5") +
+      "</div>" +
+      '<div style="margin-top:16px"><span class="eyebrow">Anything happen?</span>' +
+      '<div class="checks">' + flags.map(function (f) {
+        return '<button type="button" class="check" data-field="' + f[0] +
+          '" aria-pressed="false"><span class="box"></span>' + f[1] + "</button>";
+      }).join("") + "</div></div>" +
+      '<div style="margin-top:16px"><span class="eyebrow">Would this still be a well-traded ' +
+      'day with P&amp;L hidden?</span>' +
+      seg("well_traded", [["yes", "Yes"], ["mixed", "Mixed"], ["no", "No"]], "yes") + "</div>" +
+      '<div class="grid g-2" style="gap:14px;margin-top:16px">' +
+      '<div><span class="eyebrow">Best decision</span>' +
+      '<textarea class="note" rows="2" data-field="best_decision"></textarea></div>' +
+      '<div><span class="eyebrow">Biggest mistake</span>' +
+      '<textarea class="note" rows="2" data-field="biggest_mistake"></textarea></div></div>' +
+      '<button class="btn btn-primary" data-submit="post" style="margin-top:16px">' +
+      "Finish session</button></section>";
+  }
+
+  function tradeForm() {
+    var strategies = (META && META.strategies) || [];
+    var instruments = (META && META.instruments) || [{ symbol: "MES" }];
+    return '<section class="card" id="capture-form">' +
+      '<div class="card-head"><span class="eyebrow">Log a trade</span>' +
+      '<span class="chip chip-watch">recorded as keyed by hand</span></div>' +
+      todayField() +
+      '<div class="grid g-2" style="gap:14px">' +
+      '<div><span class="eyebrow">Instrument</span><select class="note" data-field="symbol">' +
+      instruments.map(function (i) {
+        return '<option value="' + esc(i.symbol) + '">' + esc(i.symbol) + "</option>";
+      }).join("") + "</select></div>" +
+      '<div><span class="eyebrow">Strategy</span><select class="note" data-field="strategy_id">' +
+      strategies.map(function (s) {
+        return '<option value="' + esc(s.strategy_id) + '">' + esc(s.name) + " v" +
+          esc(s.version) + "</option>";
+      }).join("") + "</select></div></div>" +
+      '<div style="margin-top:14px"><span class="eyebrow">Direction</span>' +
+      seg("side", [["long", "Long"], ["short", "Short"]], "long") + "</div>" +
+      '<div style="margin-top:14px"><span class="eyebrow">Execution</span>' +
+      seg("execution_mode", [["manual", "Manual"], ["semi_auto", "Semi-auto"], ["bot", "Bot"]],
+          "manual") + "</div>" +
+      '<div class="grid g-3" style="gap:14px;margin-top:14px">' +
+      numField("Quantity", "quantity", "2") +
+      numField("Planned quantity", "planned_quantity", "2") +
+      numField("Entry price", "avg_entry_price", "") +
+      numField("Exit price", "avg_exit_price", "") +
+      numField("Initial stop", "initial_stop", "") +
+      numField("Target", "initial_target", "") +
+      textField("Entry time", "entry_at", "2026-08-07T10:04", "datetime-local") +
+      textField("Exit time", "exit_at", "", "datetime-local") +
+      numField("Fees total", "commission", "1.04") +
+      "</div>" +
+      '<details class="disclosure"><summary>Excursions and notes (optional)</summary>' +
+      '<div class="grid g-2" style="gap:14px">' +
+      numField("Best price reached", "reported_mfe_price", "") +
+      numField("Worst price reached", "reported_mae_price", "") +
+      numField("Intended entry price", "intended_entry_price", "") +
+      "</div>" +
+      '<div style="margin-top:12px"><span class="eyebrow">Execution note</span>' +
+      '<textarea class="note" rows="2" data-field="execution_note"></textarea></div></details>' +
+      '<button class="btn btn-primary" data-submit="trade" style="margin-top:16px">' +
+      "Save trade</button>" +
+      '<p class="small muted" style="margin-top:10px">Best and worst price reached are optional ' +
+      "and are stored as your report, not as measurement — MFE and MAE are derived from them " +
+      "and labelled accordingly until a market-data source exists.</p></section>";
+  }
+
+  function setupForm() {
+    var strategies = (META && META.strategies) || [];
+    var statuses = (META && META.opportunity_statuses) || [];
+    return '<section class="card" id="capture-form">' +
+      '<div class="card-head"><span class="eyebrow">Log a qualified setup</span>' +
+      '<span class="chip chip-watch">human-logged coverage</span></div>' +
+      todayField() +
+      '<div class="grid g-3" style="gap:14px">' +
+      '<div><span class="eyebrow">Strategy</span><select class="note" data-field="strategy_id">' +
+      strategies.map(function (s) {
+        return '<option value="' + esc(s.strategy_id) + '">' + esc(s.name) + "</option>";
+      }).join("") + "</select></div>" +
+      '<div><span class="eyebrow">Instrument</span><select class="note" data-field="symbol">' +
+      ((META && META.instruments) || [{ symbol: "MES" }]).map(function (i) {
+        return '<option value="' + esc(i.symbol) + '">' + esc(i.symbol) + "</option>";
+      }).join("") + "</select></div>" +
+      textField("Qualified at", "qualified_at", "", "datetime-local") + "</div>" +
+      '<div style="margin-top:14px"><span class="eyebrow">Direction</span>' +
+      seg("direction", [["long", "Long"], ["short", "Short"]], "long") + "</div>" +
+      '<div style="margin-top:14px"><span class="eyebrow">What happened</span>' +
+      '<select class="note" data-field="status">' + statuses.map(function (st) {
+        return '<option value="' + esc(st) + '">' +
+          esc((OPP_WORDS[st] || [st])[0]) + "</option>";
+      }).join("") + "</select></div>" +
+      '<div style="margin-top:14px"><span class="eyebrow">Why</span>' +
+      '<textarea class="note" rows="2" data-field="status_reason" ' +
+      'placeholder="Away from the desk; alert fired with no one watching."></textarea></div>' +
+      '<button class="btn btn-primary" data-submit="opportunity" style="margin-top:16px">' +
+      "Save setup</button>" +
+      '<p class="small muted" style="margin-top:10px">Setups logged by hand are recorded as ' +
+      "<span class=\"num\">human_logged</span>, never as engine coverage. They record what you " +
+      "noticed, which is not the same as what occurred.</p></section>";
+  }
+
+  function numField(label, field, value) {
+    return '<div><span class="eyebrow">' + esc(label) + "</span>" +
+      '<input class="note" type="number" step="any" data-field="' + field +
+      '" data-type="number" value="' + esc(value) + '"></div>';
+  }
+
+  function textField(label, field, value, type) {
+    return '<div><span class="eyebrow">' + esc(label) + "</span>" +
+      '<input class="note" type="' + (type || "text") + '" data-field="' + field +
+      '" value="' + esc(value) + '"></div>';
+  }
+
+  function sliderField(label, field, value, min, max, step, unit) {
     return '<div class="slider-row"><div class="top"><span class="lbl">' + esc(label) + "</span>" +
-      '<span class="val" data-out="' + id + '">' + value + esc(unit) + "</span></div>" +
-      '<input type="range" data-slider="' + id + '" data-unit="' + esc(unit) + '" min="' + min +
-      '" max="' + max + '" step="' + step + '" value="' + value + '" aria-label="' + esc(label) + '"></div>';
+      '<span class="val" data-out="' + field + '">' + value + esc(unit) + "</span></div>" +
+      '<input type="range" data-slider="' + field + '" data-field="' + field +
+      '" data-type="number" data-unit="' + esc(unit) + '" min="' + min + '" max="' + max +
+      '" step="' + step + '" value="' + value + '" aria-label="' + esc(label) + '"></div>';
+  }
+
+  function viewCapture() {
+    var form = { morning: morningForm, evening: eveningForm,
+                 trade: tradeForm, setup: setupForm }[CAPTURE.tab]();
+    return '<div class="page-head"><div class="grow">' +
+      '<span class="eyebrow">Capture</span><h1>Record the day</h1>' +
+      '<p class="page-sub">The two check-ins are the only things here that cannot be ' +
+      "reconstructed later. Trades and setups can be keyed by hand until an importer exists." +
+      "</p></div>" + captureTabs() + "</div>" +
+      captureBanner() +
+      '<div class="grid g-main"><div>' + form + "</div>" +
+      '<div class="stack">' + coverageCard() + promptCard() + "</div></div>";
+  }
+
+  function coverageCard() {
+    var c = (D && D.coverage) || {};
+    var bySource = c.trades_by_entry_source || {};
+    var byDetection = c.opportunities_by_detection_source || {};
+    var rows = Object.keys(bySource).map(function (k) {
+      return { label: k.replace(/_/g, " "), value: bySource[k], display: String(bySource[k]) };
+    });
+    var detect = Object.keys(byDetection).map(function (k) {
+      return { label: k.replace(/_/g, " "), value: byDetection[k], display: String(byDetection[k]) };
+    });
+    return '<section class="card"><div class="card-head"><span class="eyebrow">Coverage</span>' +
+      '<span class="muted small">where the record came from</span></div>' +
+      '<span class="eyebrow">Trades by entry source</span>' +
+      (rows.length ? hbars(rows, { plain: true }) : '<p class="muted small">No trades yet.</p>') +
+      '<hr class="divider" style="margin:14px 0"><span class="eyebrow">Setups by detection</span>' +
+      (detect.length ? hbars(detect, { plain: true }) : '<p class="muted small">None yet.</p>') +
+      '<p class="small muted" style="margin-top:12px">' + esc(c.note || "") + "</p></section>";
+  }
+
+  function promptCard() {
+    var jobs = [["Pre-session check-in", "09:10 ET"], ["Post-session check-out", "16:05 ET"],
+                ["Backup", "18:00 ET daily"]];
+    return '<section class="card"><div class="card-head">' +
+      '<span class="eyebrow">Scheduled prompts</span></div><div class="stack-sm">' +
+      jobs.map(function (j) {
+        return '<div class="rating"><span class="lbl">' + j[0] + "</span>" +
+          '<span class="num muted" style="font-size:12.5px">' + j[1] + "</span></div>";
+      }).join("") + "</div>" +
+      '<p class="small muted" style="margin-top:12px">Prompts are fired by a scheduled job on ' +
+      "this machine (see <span class=\"num\">ops/</span>). The journal never depends on a chat " +
+      "session being open, and nothing runs during the session itself.</p></section>";
   }
 
   /* ------------------------------------------------------------------ router */
@@ -1488,6 +1687,7 @@
       else a.removeAttribute("aria-current");
     });
     wireCharts();
+    updateSourceNote();
   }
 
   /* crosshair + tooltip for every chart that declares hot zones */
@@ -1525,14 +1725,20 @@
   /* ------------------------------------------------------------------ interactions */
   document.addEventListener("click", function (e) {
     var t = e.target.closest ? e.target.closest("[data-daystate],[data-week],[data-month],[data-cal]," +
-      "[data-unlock],[data-tl],[data-theme-btn],.seg button,.check") : null;
+      "[data-captab],[data-submit],[data-tl],[data-theme-btn],.seg button,.check") : null;
     if (!t) return;
 
     if (t.hasAttribute("data-daystate")) { dayState = t.getAttribute("data-daystate"); render(); return; }
     if (t.hasAttribute("data-week")) { weekKey = t.getAttribute("data-week"); render(); return; }
     if (t.hasAttribute("data-month")) { monthKey = t.getAttribute("data-month"); render(); return; }
     if (t.hasAttribute("data-cal")) { calMonth = t.getAttribute("data-cal"); render(); return; }
-    if (t.hasAttribute("data-unlock")) { researchUnlocked = t.getAttribute("data-unlock") === "1"; render(); return; }
+    if (t.hasAttribute("data-captab")) {
+      CAPTURE.tab = t.getAttribute("data-captab");
+      CAPTURE.saved = CAPTURE.error = null;
+      render();
+      return;
+    }
+    if (t.hasAttribute("data-submit")) { submitCapture(t); return; }
     if (t.hasAttribute("data-theme-btn")) { toggleTheme(); return; }
     if (t.hasAttribute("data-tl")) {
       var panel = document.getElementById("tl-" + t.getAttribute("data-tl"));
@@ -1558,6 +1764,68 @@
     if (out) out.textContent = s.value + s.getAttribute("data-unit");
   });
 
+  var SUBMIT_ROUTES = {
+    pre: ["/api/checkin/pre", "Morning check-in saved."],
+    post: ["/api/checkin/post", "Session closed and the derived metrics were rebuilt."],
+    trade: ["/api/trade", "Trade recorded, marked as keyed by hand."],
+    opportunity: ["/api/opportunity", "Setup recorded as human-logged."]
+  };
+
+  function submitCapture(button) {
+    if (CAPTURE.busy) return;
+    var form = document.getElementById("capture-form");
+    var route = SUBMIT_ROUTES[button.getAttribute("data-submit")];
+    if (!form || !route) return;
+
+    var body = formValues(form);
+    var missing = requiredMissing(button.getAttribute("data-submit"), body);
+    if (missing) {
+      CAPTURE.error = missing;
+      CAPTURE.saved = null;
+      render();
+      return;
+    }
+
+    CAPTURE.busy = true;
+    button.textContent = "Saving…";
+    api(route[0], body)
+      .then(function (result) {
+        CAPTURE.saved = route[1] + (result.outcome === "amended"
+          ? " The previous answer was kept as an amendment." : "");
+        CAPTURE.error = null;
+        return refresh();
+      })
+      .catch(function (err) {
+        CAPTURE.error = err.message;
+        CAPTURE.saved = null;
+      })
+      .then(function () {
+        CAPTURE.busy = false;
+        render();
+      });
+  }
+
+  /* Only the fields whose absence would produce a meaningless record are
+     required. Everything else may be left blank and stays NULL — a missing
+     answer is recorded as missing, never inferred. */
+  var REQUIRED_FIELDS = {
+    pre: [["date", "a date"], ["well_traded_definition", "what a well-traded day means today"]],
+    post: [["date", "a date"], ["well_traded", "the well-traded verdict"]],
+    trade: [["date", "a date"], ["symbol", "an instrument"], ["side", "a direction"],
+            ["quantity", "a quantity"], ["entry_at", "an entry time"],
+            ["avg_entry_price", "an entry price"]],
+    opportunity: [["date", "a date"], ["strategy_id", "a strategy"], ["symbol", "an instrument"],
+                  ["qualified_at", "a qualification time"], ["status", "an outcome"]]
+  };
+
+  function requiredMissing(kind, body) {
+    var missing = (REQUIRED_FIELDS[kind] || []).filter(function (f) {
+      return body[f[0]] === undefined || body[f[0]] === "";
+    });
+    if (!missing.length) return null;
+    return "Still needs " + missing.map(function (f) { return f[1]; }).join(", ") + ".";
+  }
+
   function toggleTheme() {
     var root = document.documentElement;
     var now = root.getAttribute("data-theme");
@@ -1569,22 +1837,32 @@
   }
 
   /* ------------------------------------------------------------------ chrome */
+  function updateSourceNote() {
+    var note = document.getElementById("source-note");
+    if (!note) return;
+    note.innerHTML = LIVE
+      ? 'Live database. <span class="num">' + esc((D && D.meta && D.meta.schema) || "") +
+        "</span><br>No broker connection, no order capability."
+      : "Offline demo bundle with synthetic data. Run <span class=\"num\">bin/journal serve</span> "
+        + "to record real entries.";
+  }
+
   function chrome() {
     var nav = ROUTES.map(function (r) {
       return '<a data-nav href="' + r[0] + '">' + r[1] + "</a>";
     }).join("");
 
     document.getElementById("rail").innerHTML =
-      '<div class="wordmark"><b>Trading Journal</b><span>v1 prototype</span></div>' +
+      '<div class="wordmark"><b>Trading Journal</b><span>v1 · local</span></div>' +
       '<nav class="nav">' + nav +
       '<span class="nav-group-label">Restricted</span>' +
-      '<a data-nav href="#/research">Research Mode <span class="lock">blinded</span></a>' +
+      '<a data-nav href="#/research">Research Mode <span class="lock">deferred</span></a>' +
       "</nav>" +
       '<div class="rail-foot">' +
       '<button class="theme-toggle" data-theme-btn><span>Appearance</span>' +
       '<span class="spacer"></span><span class="theme-state num">Auto</span></button>' +
-      '<p class="synthetic-note">All figures are synthetic placeholder data generated from the schema. ' +
-      "No real trading records, no broker connection.</p></div>";
+      '<p class="synthetic-note" id="source-note"></p></div>';
+    updateSourceNote();
 
     document.getElementById("topbar").innerHTML =
       "<b>Trading Journal</b>" +
@@ -1598,7 +1876,47 @@
       }).join("");
   }
 
-  chrome();
-  window.addEventListener("hashchange", render);
-  render();
+  function fetchJSON(path) {
+    return fetch(path, { headers: { "Accept": "application/json" } }).then(function (r) {
+      if (!r.ok) throw new Error(path + " " + r.status);
+      return r.json();
+    });
+  }
+
+  /* Live server when one is there, bundled synthetic payload when the file is
+     opened directly. The same interface renders both; only the banner and the
+     ability to save differ. */
+  function refresh() {
+    return fetchJSON("/api/journal")
+      .then(function (payload) {
+        D = payload;
+        LIVE = true;
+        return fetchJSON("/api/meta").catch(function () { return null; });
+      })
+      .catch(function () {
+        D = window.JOURNAL;
+        LIVE = false;
+        return null;
+      })
+      .then(function (meta) {
+        if (meta) META = meta;
+        buildIndexes();
+      });
+  }
+
+  function boot() {
+    chrome();
+    document.getElementById("view").innerHTML =
+      '<div class="view"><p class="muted">Loading the journal…</p></div>';
+    refresh().then(function () {
+      window.addEventListener("hashchange", render);
+      render();
+    }).catch(function (err) {
+      document.getElementById("view").innerHTML =
+        '<div class="view"><div class="warnband"><span class="g">error</span><p>' +
+        esc(err.message) + "</p></div></div>";
+    });
+  }
+
+  boot();
 })();
