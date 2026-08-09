@@ -260,6 +260,11 @@
         : '<div class="card"><p class="muted">Nothing traded yet today. A day with no ' +
           "trades is still a day worth recording.</p></div>") +
 
+      // Reachable from the phone without the desktop rail. Until an export
+      // adapter exists this is the only way a real trade gets in, so it does
+      // not hide behind a menu.
+      '<a class="btn btn-ghost btn-wide" href="#/log">Log a trade</a>' +
+
       (day.went_well || day.went_poorly || day.lesson
         ? '<section class="card"><div class="card-head">' +
           '<span class="eyebrow">How the day went</span></div>' +
@@ -876,16 +881,123 @@
     run(button, "/api/review", body, "Reviewed.");
   }
 
-  function run(button, path, body, okMessage) {
+  function run(button, path, body, okMessage, onSaved) {
     if (CAPTURE.busy) return;
     CAPTURE.busy = true;
     var original = button.textContent;
     button.textContent = "Saving…";
     api(path, body)
-      .then(function () { toast(okMessage); return refresh(); })
+      .then(function () { if (onSaved) onSaved(); toast(okMessage); return refresh(); })
       .then(function () { location.hash = "#/today"; render(); })
       .catch(function (err) { toast(err.message, "err"); })
       .then(function () { CAPTURE.busy = false; button.textContent = original; });
+  }
+
+  /* ------------------------------------------------------------- LOG A TRADE */
+  // One decision, whole lifecycle, one submission — the lead account only.
+  // Follower fills are never derived from this: an unobserved copy is not
+  // evidence that the copy happened, and copy quality is the thing this journal
+  // exists to measure honestly.
+  var LEGS = [];
+
+  function blankLeg(action) {
+    return { action: action || "ADD", time: nowLocalTime(), quantity: "", price: "" };
+  }
+
+  function nowLocalTime() {
+    var d = new Date();
+    return String(d.getHours()).padStart(2, "0") + ":" +
+           String(d.getMinutes()).padStart(2, "0");
+  }
+
+  function legRow(leg, i) {
+    var actions = ["OPEN", "ADD", "REDUCE", "CLOSE"];
+    return '<div class="leg" data-leg="' + i + '">' +
+      '<div class="choices leg-act" data-leg-action="' + i + '">' +
+      actions.map(function (a) {
+        return '<button type="button" class="choice" data-value="' + a + '" aria-pressed="' +
+          (leg.action === a) + '">' + (a === "REDUCE" ? "Out" : a === "ADD" ? "Add" :
+            a === "OPEN" ? "Open" : "Close") + "</button>"; }).join("") + "</div>" +
+      '<div class="leg-fields">' +
+      '<input type="text" inputmode="numeric" data-leg-field="quantity" value="' +
+      esc(leg.quantity) + '" placeholder="qty" aria-label="contracts">' +
+      '<input type="text" inputmode="decimal" data-leg-field="price" value="' +
+      esc(leg.price) + '" placeholder="price" aria-label="fill price">' +
+      '<input type="time" data-leg-field="time" value="' + esc(leg.time) +
+      '" aria-label="time">' +
+      (LEGS.length > 1
+        ? '<button type="button" class="leg-x" data-leg-remove="' + i +
+          '" aria-label="remove">×</button>'
+        : "<span></span>") +
+      "</div></div>";
+  }
+
+  function viewLogTrade() {
+    if (!LEGS.length) LEGS = [blankLeg("OPEN")];
+    var symbols = ((META && META.instruments) || []).map(function (i) { return i.symbol; });
+    if (!symbols.length) symbols = ["NQ", "ES", "MNQ", "MES"];
+
+    return head("Log a trade", "One decision, however many fills.", "Manual") +
+      '<section class="card" id="log-form">' +
+
+      '<div class="field" style="margin-bottom:18px"><span class="eyebrow">Instrument</span>' +
+      '<div class="choices" data-single="symbol">' +
+      symbols.map(function (s, i) {
+        return '<button type="button" class="choice" data-value="' + esc(s) +
+          '" aria-pressed="' + (i === 0) + '">' + esc(s) + "</button>"; }).join("") +
+      "</div></div>" +
+
+      '<div class="field" style="margin-bottom:18px"><span class="eyebrow">Direction</span>' +
+      '<div class="choices" data-single="side">' +
+      '<button type="button" class="choice" data-value="BUY" aria-pressed="true">Long</button>' +
+      '<button type="button" class="choice" data-value="SELL" aria-pressed="false">Short' +
+      "</button></div></div>" +
+
+      '<div class="field" style="margin-bottom:20px">' +
+      '<span class="eyebrow">Initial stop</span>' +
+      '<input type="text" inputmode="decimal" data-field="stop_price" ' +
+      'placeholder="the stop you actually had on">' +
+      '<span class="hint">This is what makes R real. Without it R stays UNKNOWN — it ' +
+      "will not be reconstructed later from where the trade happened to go.</span></div>" +
+
+      '<div class="field"><span class="eyebrow">Fills, in order</span></div>' +
+      '<div id="legs">' + LEGS.map(legRow).join("") + "</div>" +
+      '<button type="button" class="btn btn-ghost btn-wide" data-leg-add="1" ' +
+      'style="margin:10px 0 18px">+ Another fill</button>' +
+
+      '<button class="btn btn-primary btn-wide" data-submit="log">Save the trade</button>' +
+      '<p class="small muted" style="margin-top:12px;text-align:center">Lead account only. ' +
+      "Follower fills are not assumed — they arrive with an export, or not at all." +
+      "</p></section>";
+  }
+
+  function readLegs() {
+    [].forEach.call(document.querySelectorAll("[data-leg]"), function (row) {
+      var leg = LEGS[Number(row.getAttribute("data-leg"))];
+      if (!leg) return;
+      [].forEach.call(row.querySelectorAll("[data-leg-field]"), function (input) {
+        leg[input.getAttribute("data-leg-field")] = input.value;
+      });
+    });
+  }
+
+  function submitLog(button) {
+    readLegs();
+    var form = document.getElementById("log-form");
+    var body = collect(form);
+    var legs = LEGS.filter(function (l) { return l.quantity && l.price; });
+    if (!legs.length) { toast("Add at least the opening fill", "err"); return; }
+    if (legs[0].action !== "OPEN") { toast("The first fill has to be the open", "err"); return; }
+
+    body.date = TODAY;
+    body.legs = legs.map(function (l, i) {
+      return { action: l.action, time: l.time, quantity: Number(l.quantity),
+               price: Number(l.price), side: i === 0 ? body.side : undefined };
+    });
+    if (body.stop_price) body.stop_price = Number(body.stop_price);
+    body.capture_seconds = Math.round((Date.now() - MOUNTED) / 1000);
+    delete body.side;
+    run(button, "/api/log-trade", body, "Trade saved.", function () { LEGS = []; });
   }
 
   /* ---------------------------------------------------------------- router */
@@ -912,6 +1024,7 @@
     else if (parts[1] === "accounts") html = viewAccounts();
     else if (parts[1] === "settings") html = viewSettings();
     else if (parts[1] === "capture") html = viewCaptureBias();
+    else if (parts[1] === "log") html = viewLogTrade();
     else html = viewToday();
 
     document.getElementById("view").innerHTML = '<div class="view">' + html + "</div>";
@@ -919,7 +1032,8 @@
     MOUNTED = Date.now();
 
     var current = "#/" + (parts[1] || "today");
-    var alias = { "#/trade": "#/today", "#/day": "#/history", "#/capture": "#/today" };
+    var alias = { "#/trade": "#/today", "#/day": "#/history", "#/capture": "#/today",
+                  "#/log": "#/today" };
     [].forEach.call(document.querySelectorAll("[data-nav]"), function (a) {
       var target = a.getAttribute("href");
       if (target === current || alias[current] === target) a.setAttribute("aria-current", "page");
@@ -944,9 +1058,22 @@
   /* ---------------------------------------------------------------- events */
   document.addEventListener("click", function (e) {
     var target = e.target.closest && e.target.closest(
-      "[data-cal],[data-submit],[data-reopen],[data-theme-btn],.choice");
+      "[data-cal],[data-submit],[data-reopen],[data-theme-btn],[data-leg-add]," +
+      "[data-leg-remove],.choice");
     if (!target) return;
 
+    if (target.hasAttribute("data-leg-add")) {
+      readLegs();
+      LEGS.push(blankLeg(LEGS.length ? "ADD" : "OPEN"));
+      render();
+      return;
+    }
+    if (target.hasAttribute("data-leg-remove")) {
+      readLegs();
+      LEGS.splice(Number(target.getAttribute("data-leg-remove")), 1);
+      render();
+      return;
+    }
     if (target.hasAttribute("data-cal")) { calMonth = target.getAttribute("data-cal"); render(); return; }
     if (target.hasAttribute("data-theme-btn")) { toggleTheme(); return; }
     if (target.hasAttribute("data-reopen")) {
@@ -955,13 +1082,23 @@
       return;
     }
     if (target.hasAttribute("data-submit")) {
-      if (target.getAttribute("data-submit") === "bias") submitBias(target);
+      var kind = target.getAttribute("data-submit");
+      if (kind === "bias") submitBias(target);
+      else if (kind === "log") submitLog(target);
       else submitReview(target);
       return;
     }
     if (target.classList.contains("choice")) {
       var group = target.parentElement;
       var on = target.getAttribute("aria-pressed") === "true";
+      if (group.hasAttribute("data-leg-action")) {
+        // A leg's action is one of four and always set — never toggled off.
+        var index = Number(group.getAttribute("data-leg-action"));
+        readLegs();
+        LEGS[index].action = target.getAttribute("data-value");
+        render();
+        return;
+      }
       if (group.hasAttribute("data-single")) {
         [].forEach.call(group.children, function (b) { b.setAttribute("aria-pressed", "false"); });
         target.setAttribute("aria-pressed", String(!on));
@@ -991,6 +1128,8 @@
       '<div class="rail-foot">' +
       '<a class="btn btn-primary" href="#/capture/bias" style="min-height:42px;font-size:14px">' +
       "Morning read</a>" +
+      '<a class="btn btn-ghost" href="#/log" style="min-height:42px;font-size:14px;' +
+      'margin-top:8px">Log a trade</a>' +
       '<button class="pill-btn" data-theme-btn><span>Appearance</span>' +
       '<span class="spacer"></span><span class="theme-state num">Dark</span></button>' +
       '<p class="foot-note" id="source-note"></p></div>';

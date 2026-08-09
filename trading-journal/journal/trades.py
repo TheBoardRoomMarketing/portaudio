@@ -193,9 +193,26 @@ def group_events(conn, trading_day_id: int) -> dict:
     if current:
         open_trades.append(current)
 
-    grouped += _attach_followers(conn, follower_events, open_trades)
+    # Follower fills must be able to attach to lead trades that already exist,
+    # not only to ones created in this pass. The real sequence is exactly that:
+    # the lead export arrives and is grouped, and the follower exports arrive
+    # afterwards — sometimes days later, from a different source. Considering
+    # only this run's trades left every late follower fill orphaned, and copy
+    # quality then reported nothing at all while looking perfectly healthy.
+    known = {t["id"] for t in open_trades}
+    for row in conn.execute(
+            "SELECT id, instrument_id, direction, opened_at, closed_at FROM logical_trade "
+            "WHERE trading_day_id=? AND is_demo=? ORDER BY opened_at",
+            (trading_day_id, 1 if is_demo else 0)):
+        if row["id"] not in known:
+            open_trades.append(dict(row))
 
-    for trade_id in created:
+    attached, touched = _attach_followers(conn, follower_events, open_trades)
+    grouped += attached
+
+    # Rebuild trades created here AND any that gained follower events, since a
+    # newly attached follower changes that trade's copy quality and rollups.
+    for trade_id in dict.fromkeys(created + touched):
         rebuild_trade(conn, trade_id)
 
     _refresh_day_status(conn, trading_day_id)
@@ -225,14 +242,18 @@ def _create_logical_trade(conn, trading_day_id, event, direction, lead_id,
             "direction": direction, "opened_at": event["occurred_at"], "closed_at": None}
 
 
-def _attach_followers(conn, follower_events, open_trades) -> int:
+def _attach_followers(conn, follower_events, open_trades):
     """Attach follower fills to the lead trade they were copying.
 
     A follower event belongs to the lead trade on the same instrument and
     direction whose window contains it. Anything that matches nothing is left
     unattached and surfaces as an orphan rather than inventing a trade.
+
+    Returns (count attached, ids of trades that gained events) so the caller can
+    rebuild exactly the trades whose copy quality changed.
     """
     attached = 0
+    touched: List[int] = []
     for event in follower_events:
         match = None
         for trade in open_trades:
@@ -258,7 +279,9 @@ def _attach_followers(conn, follower_events, open_trades) -> int:
             conn.execute("UPDATE execution_event SET logical_trade_id=? WHERE id=?",
                          (match["id"], event["id"]))
             attached += 1
-    return attached
+            if match["id"] not in touched:
+                touched.append(match["id"])
+    return attached, touched
 
 
 def orphan_events(conn, is_demo: bool = False) -> List[dict]:
@@ -605,3 +628,126 @@ def regroup(conn, logical_trade_id: int, action: str, note: str = "") -> dict:
         raise ValueError(f"unknown grouping action '{action}'")
     conn.commit()
     return {"logical_trade_id": logical_trade_id, "action": action}
+
+
+# --------------------------------------------------------------- manual capture
+# The first real week runs before any execution import exists, so a scaled trade
+# has to be enterable by hand. §17: manual input operates at the LOGICAL TRADE
+# level, not ten account copies.
+#
+# What this deliberately does NOT do is fan the lead's legs out across the
+# follower accounts by multiplier. It would be one line of code and it would be
+# fabrication: a follower fill that was never observed is indistinguishable from
+# one that was, once it is in the database, and the entire copy-quality feature
+# exists to detect exactly the case where a follower did something different.
+# Followers stay absent until real evidence arrives, and absence is recorded as
+# absence.
+LEG_ACTIONS = ("OPEN", "ADD", "REDUCE", "CLOSE")
+
+
+def log_manual_trade(conn, *, day_date: str, symbol: str, legs: List[dict],
+                     account_label: Optional[str] = None, tz: str = None,
+                     stop_price=None, target_price=None, capture_seconds=None,
+                     is_demo: bool = False) -> dict:
+    """Record one decision's lifecycle on the lead account, then group it.
+
+    `legs` is the sequence as it happened: OPEN, any ADDs, any REDUCEs, CLOSE.
+    Each leg is {action, time ('HH:MM' local or a full timestamp), quantity,
+    price}. The initial stop belongs on the OPEN leg — that is what makes R
+    computable, and R stays UNKNOWN without it rather than being reconstructed.
+    """
+    from . import config, repo
+
+    tz = tz or config.DEFAULT_TZ
+    if not legs:
+        raise ValueError("a trade needs at least one leg")
+
+    for i, leg in enumerate(legs):
+        if leg.get("action") not in LEG_ACTIONS:
+            raise ValueError(f"leg {i + 1}: action must be one of {LEG_ACTIONS}")
+        if not leg.get("quantity") or float(leg["quantity"]) <= 0:
+            raise ValueError(f"leg {i + 1}: a quantity is required")
+        if leg.get("price") in (None, ""):
+            raise ValueError(f"leg {i + 1}: a fill price is required")
+    if legs[0]["action"] != "OPEN":
+        raise ValueError("the first leg must be the OPEN — the sequence is the evidence")
+
+    account_id = repo.ensure_account(conn, account_label) if account_label \
+        else _lead_account_id(conn, is_demo)
+    if account_id is None:
+        raise ValueError(
+            "no lead account is configured. Set one with `journal init --account` and "
+            "mark its role LEAD, so a manual trade is attributed to the account that "
+            "made the decision.")
+    instrument_id = repo.ensure_instrument(conn, symbol)
+
+    day = conn.execute("SELECT id FROM trading_day WHERE day_date=? AND is_demo=?",
+                       (day_date, 1 if is_demo else 0)).fetchone()
+    if day:
+        day_id = day["id"]
+    else:
+        now = utcnow()
+        day_id = conn.execute(
+            "INSERT INTO trading_day(day_date,tz,status,iso_week,iso_month,created_at,"
+            "updated_at,is_demo) VALUES (?,?,'BIAS_MISSING',?,?,?,?,?)",
+            (day_date, tz, repo.iso_week_of(day_date), day_date[:7], now, now,
+             1 if is_demo else 0)).lastrowid
+
+    def when(value: str) -> str:
+        text = str(value).strip()
+        if len(text) <= 5:                       # "10:04"
+            text = f"{day_date}T{text}:00"
+        elif "T" not in text:                    # "10:04:32"
+            text = f"{day_date}T{text}"
+        return repo.local_to_utc(text.replace("Z", ""), tz)
+
+    # Direction comes from the OPEN and the rest follow it, so a REDUCE is
+    # always the opposite side without anyone having to say so on a phone.
+    long_side = str(legs[0].get("side", "BUY")).upper() in ("BUY", "LONG")
+    written, duplicates = 0, 0
+
+    for index, leg in enumerate(legs):
+        adding = leg["action"] in ("OPEN", "ADD")
+        side = ("BUY" if long_side else "SELL") if adding else \
+               ("SELL" if long_side else "BUY")
+        event_id = record_event(
+            conn, account_id=account_id, instrument_id=instrument_id,
+            event_type=leg["action"], occurred_at=when(leg.get("time") or "09:30"),
+            quantity=abs(float(leg["quantity"])), price=float(leg["price"]),
+            side=side,
+            stop_price=(leg.get("stop_price") or (stop_price if index == 0 else None)),
+            target_price=(leg.get("target_price") or (target_price if index == 0 else None)),
+            source="manual", is_demo=is_demo)
+        if event_id is None:
+            duplicates += 1
+        else:
+            written += 1
+
+    conn.commit()
+    grouped = group_events(conn, day_id)
+
+    trade = conn.execute(
+        "SELECT id, status, grouping_confidence FROM logical_trade "
+        "WHERE trading_day_id=? ORDER BY id DESC LIMIT 1", (day_id,)).fetchone()
+
+    if capture_seconds is not None and trade:
+        conn.execute(
+            "INSERT INTO trade_annotation(logical_trade_id,review_seconds,created_at,"
+            "updated_at) VALUES (?,?,?,?) ON CONFLICT(logical_trade_id) DO UPDATE SET "
+            "review_seconds=COALESCE(trade_annotation.review_seconds,0)+excluded.review_seconds,"
+            "updated_at=excluded.updated_at",
+            (trade["id"], int(capture_seconds), utcnow(), utcnow()))
+        conn.commit()
+
+    return {
+        "trading_day_id": day_id,
+        "logical_trade_id": trade["id"] if trade else None,
+        "events_written": written,
+        "already_known": duplicates,
+        "grouping": grouped,
+        "status": trade["status"] if trade else None,
+        # Said plainly rather than left to be discovered: this is the lead only.
+        "followers_captured": 0,
+        "note": ("Lead account only. Follower fills are not inferred from the lead — "
+                 "an unobserved copy is not evidence that the copy happened."),
+    }

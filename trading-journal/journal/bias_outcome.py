@@ -312,11 +312,19 @@ def compare() -> dict:
             },
         ],
         "recommendation": (
-            "Do not approve one yet. Run dry_run() on the first 20 real days, look at "
-            "where they disagree, and approve from evidence. If a choice must be made "
-            "sooner, favourable_excursion is the closest to how the read is used and is "
-            "computable from data already captured — but the honest answer is that 20 "
-            "days of disagreements will decide this better than reasoning about it now."
+            "Do not approve one yet. Run all three in dry-run over the first 20 complete "
+            "real trading days and select from the disagreements."
+        ),
+        # An earlier draft of this module suggested favourable_excursion as the
+        # likeliest choice. That suggestion was reviewed and NOT adopted, and
+        # naming a favourite before the observation period would bias the
+        # reading of the very evidence meant to settle it. All three candidates
+        # are equal here until 20 complete days say otherwise.
+        "ranking": "NONE — all three candidates are equal during the observation period",
+        "selection_question": (
+            "Which method best operationalises the pre-session directional thesis? "
+            "Not which method makes the bias look best, and never which method "
+            "correlates with profit."
         ),
         "what_none_of_them_do": [
             "None looks at P&L. A correct read traded badly must stay a correct read.",

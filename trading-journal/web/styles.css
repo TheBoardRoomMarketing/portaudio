@@ -336,6 +336,28 @@ details.matched .acct-row:first-of-type { border-top: 1px solid var(--rule); }
 
 .amber { color: var(--amber); }
 
+/* ------------------------------------------------------- manual trade legs */
+/* Entered on a phone, often one-handed, usually just after a trade closed.
+   Targets stay at 44px and the four actions sit on one row so a scale-out is
+   two taps and two numbers, not a form. */
+.leg {
+  border: 1px solid var(--rule); border-radius: var(--r-md);
+  padding: 11px 12px; margin-bottom: 10px; background: var(--surface-2);
+}
+.leg-act { gap: 5px; margin-bottom: 9px; }
+.leg-act .choice { flex: 1; min-width: 0; padding: 0 6px; font-size: 12.5px; }
+.leg-fields { display: grid; grid-template-columns: 1fr 1.3fr 1fr 34px; gap: 7px; }
+.leg-fields input { min-height: 44px; font-family: var(--mono); font-size: 14px; }
+.leg-x {
+  min-height: 44px; border: 0; background: transparent; color: var(--ink-3);
+  font-size: 20px; line-height: 1; cursor: pointer; border-radius: var(--r-sm);
+}
+.leg-x:hover { color: var(--neg); background: var(--surface-3); }
+
+@media (max-width: 380px) {
+  .leg-fields { grid-template-columns: 1fr 1.3fr 1fr 30px; gap: 5px; }
+}
+
 .warn {
   display: flex; gap: 11px; align-items: flex-start;
   border: 1px solid rgba(217,164,65,.3); background: var(--amber-wash);
@@ -393,6 +415,14 @@ input[type="range"] { accent-color: var(--cyan); padding: 0; background: none; b
 }
 .btn-primary:hover { color: #04131A; filter: brightness(1.06); }
 .btn-wide { width: 100%; }
+/* A secondary action that stays quiet next to the primary one — same size and
+   target, less pull. Used for "log a trade", which is frequent but is never the
+   thing being asked for on the screen it sits on. */
+.btn-ghost { background: var(--surface-2); border-color: var(--rule); color: var(--ink-2); }
+.btn-ghost:hover { border-color: var(--cyan); color: var(--cyan); }
+
+/* Explanatory text under a field: why it matters, not what to type. */
+.hint { font-size: 12px; color: var(--ink-3); line-height: 1.45; margin-top: 5px; }
 
 .slider-row { display: flex; flex-direction: column; gap: 7px; }
 .slider-row .top { display: flex; justify-content: space-between; align-items: baseline; }

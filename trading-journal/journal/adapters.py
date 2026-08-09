@@ -191,8 +191,15 @@ class _BlockedAdapter:
 class TradeSeaAdapter(_BlockedAdapter):
     name = "tradesea"
     status = BLOCKED_ON_SAMPLE
-    needs = ("one redacted export from TradeSea's journal (Compass), so the column "
-             "layout can be mapped and verified")
+    needs = (
+        "ONE redacted export of lead-account execution history. Ideally it contains "
+        "several futures trades including at least one scale-in and at least one "
+        "partial scale-out, with timestamps, instrument, side, quantity, fill price, "
+        "order/fill IDs if present, and fees if present. Redact account number, legal "
+        "name, email, credentials and any private identifier — keep the headers and "
+        "the row structure exactly as exported. A small file is enough; what is being "
+        "mapped is the schema, not the performance."
+    )
     evidence = (
         "TradeSea is a Rithmic-based web and mobile platform with its own analytics "
         "and journal component. No public third-party API is documented. The realistic "
@@ -204,8 +211,14 @@ class TradeSeaAdapter(_BlockedAdapter):
 class TradeSyncerAdapter(_BlockedAdapter):
     name = "tradesyncer"
     status = BLOCKED_ON_SAMPLE
-    needs = ("one redacted export of copy activity showing per-follower fills, so "
-             "follower executions can be matched to lead executions")
+    needs = (
+        "an answer to ONE question, which no public documentation settles: in the "
+        "TradeSyncer dashboard, does any export or download produce rows that carry "
+        "BOTH a fill (timestamp, instrument, side, quantity, price) AND which "
+        "follower account it happened on? If yes, one redacted sample maps it. If no, "
+        "follower fills have to come from each prop dashboard or broker statement "
+        "instead, and FOLLOWER_EXECUTION_SOURCE is INCOMPLETE until they do."
+    )
     evidence = (
         "TradeSyncer is a cloud copier connecting brokers including Tradovate, Rithmic, "
         "NinjaTrader, TradingView and ProjectX, and ships a journal that accepts an "

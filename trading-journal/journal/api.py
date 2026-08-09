@@ -326,6 +326,16 @@ class JournalHandler(BaseHTTPRequestHandler):
             day_id = _trading_day_id(conn, payload.get("date"))
             return bias_mod.amend(conn, day_id, payload["changes"], payload["reason"])
 
+        if path == "/api/log-trade":
+            # Manual capture at the logical-trade level: one decision's whole
+            # lifecycle in one submission, lead account only.
+            return trades_mod.log_manual_trade(
+                conn, day_date=payload.get("date"), symbol=payload["symbol"],
+                legs=payload["legs"], account_label=payload.get("account_label"),
+                stop_price=payload.get("stop_price"),
+                target_price=payload.get("target_price"),
+                capture_seconds=payload.get("capture_seconds"))
+
         if path == "/api/review":
             return trades_mod.submit_review(conn, int(payload["logical_trade_id"]), payload)
 

@@ -313,6 +313,13 @@ def day_friction(conn) -> dict:
         "backlog": {
             "unreviewed_trades": trades - reviewed,
             "needing_grouping_review": sum(r["trades_needing_grouping"] for r in rows),
+            # How often the grouping engine had to be corrected by hand. A rising
+            # count is evidence the grouping rule is wrong for how Zack actually
+            # re-enters, which is a fix in the engine rather than in the habit.
+            "grouping_corrections": conn.execute(
+                "SELECT COUNT(*) c FROM logical_trade WHERE is_demo=0 "
+                "AND grouping_note IS NOT NULL AND grouping_confidence='high'"
+            ).fetchone()["c"],
             "note": "A growing backlog is the earliest sign the evening review is too "
                     "long, well before anyone reports it as annoying.",
         },
@@ -336,6 +343,11 @@ def day_friction(conn) -> dict:
             "voice_notes": sum(r["voice_notes"] for r in rows),
             "media_assets": sum(r["media_assets"] for r in rows),
         },
+        "not_instrumented": [
+            "tap count and copy-panel expansion count — no interaction telemetry is "
+            "collected, and inventing a proxy for it would be worse than the gap. "
+            "Timings and completion rates are measured because they are real events.",
+        ],
     }
 
 

@@ -230,6 +230,83 @@ def cmd_access(args) -> int:
     return 0
 
 
+def cmd_preflight(args) -> int:
+    """Everything that should be true before the first real trading day.
+
+    One command rather than a checklist to remember, and it exits non-zero if
+    anything is wrong so it can gate a script. Nothing here is fixed
+    automatically — a preflight that quietly repairs things teaches you to stop
+    reading it.
+    """
+    from . import bias_observation as obs
+
+    problems, notes = [], []
+    conn = db.connect()
+    try:
+        state = demo.status(conn)
+        if not state["clean_for_real_use"]:
+            problems.append(
+                f"{state['demo_rows']} demo rows present. Run `journal demo --purge`.")
+
+        integrity = db.integrity_check(conn)
+        if not integrity["ok"]:
+            problems.extend(integrity["problems"])
+
+        lead = conn.execute(
+            "SELECT label FROM account WHERE role='LEAD' AND is_demo=0 LIMIT 1").fetchone()
+        if not lead:
+            problems.append(
+                "no account is marked LEAD. Grouping is driven by the lead account, "
+                "so manual capture and import both need one.")
+        else:
+            notes.append(f"lead account: {lead['label']}")
+
+        followers = conn.execute(
+            "SELECT COUNT(*) c FROM account WHERE role='FOLLOWER' AND is_demo=0"
+        ).fetchone()["c"]
+        notes.append(f"{followers} follower accounts registered")
+        if not followers:
+            notes.append("no followers registered yet — copy quality stays empty until "
+                         "there are some, which is accurate rather than broken")
+    finally:
+        conn.close()
+
+    key = crypto.key_status()
+    if not key["present"]:
+        notes.append("backups are not encrypted yet. `journal backup --encrypt` turns it "
+                     "on once and every later backup follows.")
+    if key["problem"]:
+        problems.append(key["problem"])
+
+    archives = sorted(config.BACKUP_DIR.glob("journal-*.tar.gz*")) \
+        if config.BACKUP_DIR.exists() else []
+    if not archives:
+        notes.append("no backup archive exists yet. Take one before the first real day.")
+
+    admin = db.connect(restricted=False)
+    try:
+        leaks = obs.leak_check(admin)
+    finally:
+        admin.close()
+    problems.extend(leaks)
+
+    _out({
+        "ready": not problems,
+        "problems": problems,
+        "notes": notes,
+        "data_home": str(config.DATA_HOME),
+        "confirmations": {
+            "LIVE_TRADING_ACTIONS": "NONE",
+            "BROKER_ORDER_CAPABILITY_ADDED": False,
+            "RESEARCH_MODE_ENABLED": False,
+            "PERSONAL_ASTRO_ANALYSIS_EXECUTED": False,
+            "BIAS_OUTCOMES_ASSIGNED": False,
+            "REAL_PERFORMANCE_CORRELATION_ANALYSIS": False,
+        },
+    })
+    return 0 if not problems else 1
+
+
 def cmd_demo(args) -> int:
     conn = db.connect()
     try:
@@ -356,6 +433,40 @@ def cmd_bias_methods(args) -> int:
     return 0
 
 
+def cmd_bias_observe(args) -> int:
+    """The 20-day dry-run observation period.
+
+    Runs on an unrestricted connection because the observation layer is
+    deliberately unreadable from the daily one. Nothing here writes a bias
+    outcome.
+    """
+    from . import bias_observation as obs
+
+    conn = db.connect(restricted=False)
+    try:
+        if args.price:
+            row = conn.execute(
+                "SELECT id, day_date FROM trading_day WHERE day_date=? AND is_demo=0",
+                (args.date,)).fetchone()
+            if not row:
+                print(f"no real trading day on {args.date}", file=sys.stderr)
+                return 1
+            obs.record_price(conn, row["id"], row["day_date"], open=args.open,
+                             high=args.high, low=args.low, close=args.close,
+                             atr=args.atr, source=args.source)
+            print(f"price recorded for {args.date} from {args.source}")
+
+        if args.run:
+            _out(obs.run_all(conn))
+        elif args.compare:
+            _out(obs.comparison(conn))
+        elif not args.price:
+            _out({"progress": obs.progress(conn), "leaks": obs.leak_check(conn)})
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_review(args) -> int:
     conn = db.connect()
     try:
@@ -459,6 +570,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="round-trip and tamper-check with an ephemeral key")
     s.set_defaults(func=cmd_keys)
 
+    s = sub.add_parser("preflight",
+                       help="everything that should be true before the first real day")
+    s.set_defaults(func=cmd_preflight)
+
     s = sub.add_parser("demo", help="synthetic-data status, and purge before real capture")
     s.add_argument("--purge", action="store_true", help="delete every demo row")
     s.add_argument("--require-clean", action="store_true",
@@ -495,6 +610,20 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("bias-methods",
                        help="candidate bias-outcome methodologies (none approved)")
     s.set_defaults(func=cmd_bias_methods)
+
+    s = sub.add_parser("bias-observe",
+                       help="20-day dry-run observation (writes no bias outcome)")
+    s.add_argument("--price", action="store_true", help="record a day's session price")
+    s.add_argument("--date", help="trading day, YYYY-MM-DD")
+    s.add_argument("--open", type=float)
+    s.add_argument("--high", type=float)
+    s.add_argument("--low", type=float)
+    s.add_argument("--close", type=float)
+    s.add_argument("--atr", type=float)
+    s.add_argument("--source", default="", help="where the prices came from")
+    s.add_argument("--run", action="store_true", help="dry-run every eligible day")
+    s.add_argument("--compare", action="store_true", help="the comparison report")
+    s.set_defaults(func=cmd_bias_observe)
 
     s = sub.add_parser("review", help="the real-use checkpoint report")
     s.set_defaults(func=cmd_review)
