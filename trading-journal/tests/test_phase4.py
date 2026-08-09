@@ -9,7 +9,9 @@ days that will not happen again.
 
 from __future__ import annotations
 
+import base64
 import http.cookiejar
+import secrets
 import sqlite3
 import sys
 import tarfile
@@ -176,6 +178,59 @@ class TestBackupEncryption(WorkflowTestCase):
         # The key landed inside this test's temporary directory and nowhere else.
         self.assertTrue(crypto._key_file_path().exists())
         self.assertEqual(crypto._key_file_path().parent, Path(config.DATA_HOME))
+
+    def test_an_exported_key_restores_and_opens_an_old_archive(self):
+        """The whole point of escrow, end to end: back up, lose the key with the
+        machine, restore from the password-manager copy, open the archive."""
+        archive = backup.create(self.conn, label="before", encrypt=True)
+        escrowed = crypto.export_key()
+
+        crypto._key_file_path().unlink()          # the machine is gone
+        self.assertIsNone(crypto.get_key(create=False))
+        with self.assertRaises(RuntimeError):
+            backup.verify(archive)
+
+        crypto.import_key(escrowed)
+        self.assertTrue(backup.verify(archive)["ok"])
+
+    def test_exporting_without_a_key_says_so_rather_than_inventing_one(self):
+        with self.assertRaises(crypto.NoKey):
+            crypto.export_key()
+
+    def test_importing_a_different_key_over_an_existing_one_is_refused(self):
+        """Replacing the key silently makes every archive under the old one
+        unopenable, and nothing afterwards can tell you that is what happened."""
+        crypto.get_key(create=True)
+        other = base64.b64encode(secrets.token_bytes(32)).decode()
+
+        with self.assertRaises(crypto.KeyError_) as ctx:
+            crypto.import_key(other)
+        self.assertIn("unopenable", str(ctx.exception))
+
+        crypto.import_key(other, force=True)      # deliberate replacement is allowed
+
+    def test_reimporting_the_same_key_is_not_treated_as_a_replacement(self):
+        crypto.get_key(create=True)
+        result = crypto.import_key(crypto.export_key())
+        self.assertFalse(result["replaced"])
+
+    def test_a_truncated_or_corrupt_key_is_rejected_on_import(self):
+        crypto.get_key(create=True)
+        encoded = crypto.export_key()
+        for bad in ("not base64 at all!", encoded[:20], ""):
+            with self.subTest(bad=bad[:12]):
+                with self.assertRaises(crypto.KeyError_):
+                    crypto.import_key(bad, force=True)
+
+    def test_the_fingerprint_identifies_a_key_without_revealing_it(self):
+        """So a copy in a password manager can be checked against the key in use
+        without either being exposed to do it."""
+        key = crypto.get_key(create=True)
+        fp = crypto.fingerprint(key)
+
+        self.assertEqual(fp, crypto.key_status()["fingerprint"])
+        self.assertNotIn(base64.b64encode(key).decode()[:16], fp)
+        self.assertNotEqual(fp, crypto.fingerprint(secrets.token_bytes(32)))
 
     def test_a_fresh_data_home_starts_with_no_key(self):
         """The property the macOS failure violated: a brand new journal has no

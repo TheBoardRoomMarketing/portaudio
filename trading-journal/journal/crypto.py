@@ -158,21 +158,94 @@ def get_key(create: bool = False) -> Optional[bytes]:
     return key
 
 
+def fingerprint(key: bytes) -> str:
+    """A short public identifier for a key.
+
+    Safe to print, log and compare. It exists so a copy kept in a password
+    manager can be checked against the key actually in use, without either one
+    being revealed to do it.
+    """
+    return hashlib.sha256(b"tjbk-fingerprint:" + key).hexdigest()[:16]
+
+
 def key_status() -> dict:
     source = key_source()
+    fp = None
     try:
-        present = get_key(create=False) is not None
-        problem = None
+        key = get_key(create=False)
+        present, problem = key is not None, None
+        if key:
+            fp = fingerprint(key)
     except KeyError_ as exc:
         present, problem = False, str(exc)
     return {
         "source": source,
         "present": present,
+        "fingerprint": fp,
         "problem": problem,
         "location": ("login keychain: service=" + SERVICE) if source == "keychain"
                     else str(_key_file_path()),
         "note": "The key is never committed, never logged and never included in a backup.",
     }
+
+
+# ------------------------------------------------------------------ escrow
+class NoKey(RuntimeError):
+    pass
+
+
+def export_key() -> str:
+    """The key as base64, for storing in a password manager.
+
+    A key that exists in exactly one place is a single point of failure for the
+    thing backups are meant to survive: lose the machine and the archives become
+    permanently unopenable, even if copies of them exist elsewhere. So the key
+    has to be exportable — but deliberately, once, by a human who asked.
+
+    The caller is responsible for showing this only to a person. `cli` refuses
+    unless stdout is a terminal, which is what keeps it out of files and logs.
+    """
+    key = get_key(create=False)
+    if key is None:
+        raise NoKey("there is no key to export yet. `journal backup --encrypt` "
+                    "creates one on first use.")
+    return base64.b64encode(key).decode()
+
+
+def import_key(encoded: str, *, force: bool = False) -> dict:
+    """Restore a previously exported key — a new machine, or a rebuilt one.
+
+    Refuses to replace an existing key unless forced, because replacing it
+    silently makes every archive encrypted under the old one unopenable, and
+    nothing afterwards can tell you that is what happened.
+    """
+    try:
+        key = base64.b64decode(encoded.strip(), validate=True)
+    except Exception as exc:  # noqa: BLE001 — any decode failure is the same answer
+        raise KeyError_("that is not a valid exported key (expected base64)") from exc
+    if len(key) != 32:
+        raise KeyError_(
+            f"an exported key is 32 bytes; this decoded to {len(key)}. "
+            "Check it was copied whole.")
+
+    existing = get_key(create=False)
+    if existing and existing != key and not force:
+        raise KeyError_(
+            f"a different key is already stored (fingerprint {fingerprint(existing)}). "
+            "Replacing it would make every archive encrypted under it permanently "
+            "unopenable. Pass force=True only if you are certain.")
+
+    source = key_source()
+    if source == "keychain":
+        _keychain_set(key)
+    else:
+        _file_set(key)
+
+    check = _keychain_get() if source == "keychain" else _file_get()
+    if check != key:
+        raise KeyError_("the key could not be read back after storing it")
+    return {"source": source, "fingerprint": fingerprint(key),
+            "replaced": bool(existing and existing != key)}
 
 
 # --------------------------------------------------------------------- cipher

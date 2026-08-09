@@ -206,9 +206,55 @@ def cmd_backup(args) -> int:
 
 
 def cmd_keys(args) -> int:
-    """Inspect or create the backup encryption key. Never prints the key."""
+    """Inspect, create, export or restore the backup encryption key.
+
+    The key value is shown only by --export, only to a terminal, and never
+    appears in ordinary output.
+    """
     if args.create:
         crypto.get_key(create=True)
+
+    if args.export:
+        # Refuse unless a human is looking. Redirecting to a file or a log is
+        # exactly the outcome the "never printed to logs" rule exists to prevent,
+        # and a TTY check is what distinguishes the two.
+        if not sys.stdout.isatty():
+            print("refusing to print the key to something that is not a terminal. "
+                  "Run this interactively and copy it into a password manager.",
+                  file=sys.stderr)
+            return 2
+        try:
+            encoded = crypto.export_key()
+        except crypto.NoKey as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        status = crypto.key_status()
+        print("\nBackup encryption key — store this in a password manager NOW.\n")
+        print(f"  {encoded}\n")
+        print(f"  fingerprint  {status['fingerprint']}")
+        print(f"  stored in    {status['location']}\n")
+        print("Without it, every encrypted archive is permanently unopenable — "
+              "including copies on another disk.")
+        print("Restore it on a new machine with:  journal keys --import\n")
+        return 0
+
+    if getattr(args, "import_key", False):
+        # Read from a prompt, not from argv: a command line lands in shell
+        # history and is visible in a process listing while it runs.
+        import getpass  # noqa: PLC0415 — only needed on this path
+
+        encoded = getpass.getpass("Paste the exported key (input hidden): ")
+        try:
+            result = crypto.import_key(encoded, force=args.force)
+        except (crypto.KeyError_, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"key restored to {result['source']} "
+              f"(fingerprint {result['fingerprint']})"
+              + (" — previous key replaced" if result["replaced"] else ""))
+        print("Verify with:  journal verify <an existing archive>")
+        return 0
+
     payload = {"key": crypto.key_status(), "cipher": crypto.cipher_name()}
     if args.self_test:
         payload["self_test"] = crypto.self_test()
@@ -387,6 +433,14 @@ def cmd_preflight(args) -> int:
     if not key["present"]:
         notes.append("backups are not encrypted yet. `journal backup --encrypt` turns it "
                      "on once and every later backup follows.")
+    else:
+        # The failure this guards against is total and silent: the machine dies,
+        # the key dies with it, and archives sitting safely on another disk turn
+        # out to be permanently unopenable.
+        notes.append(
+            f"backup key fingerprint {key['fingerprint']} — it exists only on this "
+            "machine. If you have not put a copy in a password manager, run "
+            "`journal keys --export` now; without it every archive is unopenable.")
     if key["problem"]:
         problems.append(key["problem"])
 
@@ -676,10 +730,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write a plain archive even though a key exists")
     s.set_defaults(func=cmd_backup)
 
-    s = sub.add_parser("keys", help="backup encryption key status (never prints the key)")
+    s = sub.add_parser("keys", help="backup encryption key: status, escrow, restore")
     s.add_argument("--create", action="store_true", help="create the key if absent")
     s.add_argument("--self-test", action="store_true",
                    help="round-trip and tamper-check with an ephemeral key")
+    s.add_argument("--export", action="store_true",
+                   help="print the key once, to a terminal only, for a password manager")
+    s.add_argument("--import", dest="import_key", action="store_true",
+                   help="restore an exported key on a new machine (prompts, hidden)")
+    s.add_argument("--force", action="store_true",
+                   help="with --import, replace a different existing key")
     s.set_defaults(func=cmd_keys)
 
     s = sub.add_parser("accounts", help="register accounts and set lead/follower roles")
