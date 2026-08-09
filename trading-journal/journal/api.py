@@ -1,12 +1,17 @@
 """The local application server.
 
-Binds to loopback only. That bind is the security boundary — there is no
+Binds to loopback by default. That bind is the security boundary — there is no
 account system because there is no remote surface to authenticate. Two habits
 keep a local server from becoming a hole a browser can reach through:
 
   * POSTs must be application/json, which blocks the cross-site form post;
   * a request carrying a foreign Origin is refused, which blocks the
     DNS-rebinding trick where a hostile page resolves to 127.0.0.1.
+
+A wider bind — for capture from the phone — is possible, and switches on token
+authentication automatically. There is no flag combination that produces an
+unauthenticated service beyond loopback; journal/access.py enforces that, and
+refuses a publicly routable address outright.
 
 There are no endpoints here that place, cancel or route an order, and no
 credential capable of doing so exists anywhere in this project.
@@ -21,10 +26,10 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from . import (backup, bias as bias_mod, config, contracts, db, importers,
-               metrics, repo, trades as trades_mod)
+from . import (access, backup, bias as bias_mod, config, contracts, db, demo as demo_mod,
+               importers, metrics, repo, trades as trades_mod)
 
 _LOCK = threading.Lock()
 
@@ -32,6 +37,7 @@ _LOCK = threading.Lock()
 class JournalHandler(BaseHTTPRequestHandler):
     server_version = "TradingJournal/1.0"
     protocol_version = "HTTP/1.1"
+    _set_cookie = False
 
     # ------------------------------------------------------------- plumbing
     def log_message(self, fmt, *args):
@@ -43,7 +49,45 @@ class JournalHandler(BaseHTTPRequestHandler):
         if not origin:
             return True
         host = urlparse(origin).hostname
-        return host in ("127.0.0.1", "localhost", "::1")
+        # The bound address is added to the allowed set, because on a phone the
+        # page's own origin IS the Tailscale or LAN address.
+        return host in ("127.0.0.1", "localhost", "::1", self.server.bind_host)
+
+    # ------------------------------------------------------------- token
+    def _supplied_token(self):
+        """Token from, in order: header, query string, cookie.
+
+        The query string is what makes a phone bookmark work — iOS cannot set a
+        header by typing a URL. The first such request is answered with a
+        cookie so the token stops travelling in URLs (and therefore stops
+        appearing in history and referrers) for everything after it.
+        """
+        header = self.headers.get("X-Journal-Token")
+        if header:
+            return header.strip(), "header"
+        query = parse_qs(urlparse(self.path).query).get("t")
+        if query:
+            return query[0], "query"
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == access.COOKIE_NAME:
+                return value, "cookie"
+        return None, None
+
+    def _authorized(self) -> bool:
+        """True if this request may proceed. Loopback needs no token."""
+        if not self.server.require_token:
+            return True
+        supplied, where = self._supplied_token()
+        if not access.token_matches(supplied, self.server.token):
+            return False
+        self._set_cookie = (where == "query")
+        return True
+
+    def _refuse_unauthorized(self):
+        # No hint about what a valid token looks like, and the rejected value is
+        # never echoed or logged — a log full of near-miss tokens is its own leak.
+        self._json({"error": "a valid access token is required"}, 401)
 
     def _send(self, status: int, body: bytes, content_type: str, extra=None):
         self.send_response(status)
@@ -51,6 +95,13 @@ class JournalHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self._set_cookie:
+            self._set_cookie = False
+            self.send_header(
+                "Set-Cookie",
+                f"{access.COOKIE_NAME}={self.server.token}; Path=/; HttpOnly; "
+                "SameSite=Strict; Max-Age=2592000")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -79,6 +130,8 @@ class JournalHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- routing
     def do_GET(self):
         path = urlparse(self.path).path
+        if not self._authorized():
+            return self._refuse_unauthorized()
         try:
             if path.startswith("/api/"):
                 return self._get_api(path)
@@ -91,6 +144,8 @@ class JournalHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if not self._authorized():
+            return self._refuse_unauthorized()
         if not self._origin_ok():
             return self._error(403, "cross-origin request refused")
         if "application/json" not in (self.headers.get("Content-Type") or ""):
@@ -140,7 +195,10 @@ class JournalHandler(BaseHTTPRequestHandler):
             if path == "/api/journal":
                 return self._json(repo.journal_payload(conn))
             if path == "/api/day-journal":
-                return self._json(repo.day_journal_payload(conn))
+                query = parse_qs(urlparse(self.path).query)
+                mode = (query.get("mode") or [None])[0]
+                demo = True if mode == "demo" else (False if mode == "real" else None)
+                return self._json(repo.day_journal_payload(conn, demo=demo))
             if path == "/api/meta":
                 return self._json(self._meta(conn))
             if path == "/api/status":
@@ -258,7 +316,9 @@ class JournalHandler(BaseHTTPRequestHandler):
             bias_id = bias_mod.record(
                 conn, day_id, direction=payload["direction"],
                 strength=payload.get("strength"), thesis=payload.get("thesis"),
-                invalidation=payload.get("invalidation"), sources=payload.get("sources"),
+                invalidation=payload.get("invalidation"),
+                invalidation_level=payload.get("invalidation_level"),
+                sources=payload.get("sources"),
                 capture_seconds=payload.get("capture_seconds"))
             return {"trading_day_id": day_id, "daily_bias_id": bias_id}
 
@@ -276,6 +336,9 @@ class JournalHandler(BaseHTTPRequestHandler):
         if path == "/api/group":
             day_id = _trading_day_id(conn, payload.get("date"))
             return trades_mod.group_events(conn, day_id)
+
+        if path == "/api/demo/purge":
+            return demo_mod.purge(conn)
 
         if path == "/api/recompute":
             return metrics.recompute_all(conn, note="manual")
@@ -348,19 +411,29 @@ class JournalServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, handler, db_path=None, verbose=False):
+    def __init__(self, addr, handler, db_path=None, verbose=False,
+                 token=None, require_token=False):
         super().__init__(addr, handler)
         self.db_path = db_path or config.DB_PATH
         self.verbose = verbose
+        self.bind_host = addr[0]
+        self.token = token
+        self.require_token = require_token
 
     def connect(self):
         return db.connect(self.db_path)
 
 
 def serve(host: str = config.SERVER_HOST, port: int = config.SERVER_PORT,
-          db_path=None, verbose: bool = False) -> JournalServer:
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        raise ValueError(
-            f"refusing to bind {host}: the journal is a local application and its "
-            "loopback bind is its only access control")
-    return JournalServer((host, port), JournalHandler, db_path=db_path, verbose=verbose)
+          db_path=None, verbose: bool = False, token=None) -> JournalServer:
+    """Start the server. A non-loopback bind is token-authenticated, always.
+
+    The decision lives in journal/access.py so there is exactly one place where
+    "may this be reachable, and what protects it" is answered.
+    """
+    plan = access.resolve_bind(host, token=token)
+    server = JournalServer((plan["host"], port), JournalHandler, db_path=db_path,
+                           verbose=verbose, token=plan["token"],
+                           require_token=plan["require_token"])
+    server.plan = plan
+    return server

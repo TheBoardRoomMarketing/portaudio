@@ -58,6 +58,12 @@ CALC_VERSION = "metrics@1.0.0"
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = int(os.environ.get("JOURNAL_PORT", "8765"))
 
+# Backup encryption is opt-in once, then automatic. "auto" means: encrypt if an
+# encryption key already exists, otherwise write a plain archive and say so.
+# Creating the key (journal backup --encrypt) is what flips it on permanently,
+# so nobody ends up with archives they cannot open because a setting drifted.
+BACKUP_ENCRYPT = os.environ.get("JOURNAL_BACKUP_ENCRYPT", "auto")
+
 
 def ensure_dirs() -> None:
     for d in RUNTIME_DIRS:

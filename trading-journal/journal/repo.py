@@ -641,17 +641,30 @@ def journal_payload(conn) -> dict:
     }
 
 
-def day_journal_payload(conn) -> dict:
+def day_journal_payload(conn, demo: Optional[bool] = None) -> dict:
     """Everything the interface reads, in one round trip.
 
     Built around the real object model: a trading day holds a morning read and
     logical trades; a logical trade holds execution events across every account
     that participated. Account executions are never presented as trades.
+
+    The payload is always scoped to exactly ONE of real or demo data — never
+    both. Mixing them in a single view is how synthetic sessions end up averaged
+    into a real distribution, which cannot be undone afterwards by looking at
+    the numbers. When `demo` is None the choice is made by what exists: real
+    data if there is any, demo otherwise, and `meta.mode` says which.
     """
     from . import trades as trades_mod
 
+    if demo is None:
+        has_real = conn.execute(
+            "SELECT COUNT(*) c FROM trading_day WHERE is_demo=0").fetchone()["c"]
+        demo = not has_real
+    demo_flag = 1 if demo else 0
+
     days = []
-    for d in _rows(conn, "SELECT * FROM trading_day ORDER BY day_date DESC LIMIT 90"):
+    for d in _rows(conn, "SELECT * FROM trading_day WHERE is_demo=? "
+                         "ORDER BY day_date DESC LIMIT 90", demo_flag):
         day_id = d["id"]
         bias_row = _one(conn, "SELECT * FROM daily_bias WHERE trading_day_id=?", day_id)
         if bias_row:
@@ -660,8 +673,8 @@ def day_journal_payload(conn) -> dict:
                 conn, "SELECT field,old_value,new_value,reason,amended_at FROM bias_amendment "
                       "WHERE daily_bias_id=? ORDER BY amended_at", bias_row["id"])
 
-        trade_rows = _rows(conn, "SELECT * FROM v_trade_inbox WHERE day_date=? "
-                                 "ORDER BY opened_at", d["day_date"])
+        trade_rows = _rows(conn, "SELECT * FROM v_trade_inbox WHERE day_date=? AND is_demo=? "
+                                 "ORDER BY opened_at", d["day_date"], demo_flag)
         for t in trade_rows:
             tid = t["logical_trade_id"]
             t["timeline"] = trades_mod.position_timeline(conn, tid)
@@ -710,13 +723,18 @@ def day_journal_payload(conn) -> dict:
                 (d["is_demo"],)).fetchone()["c"],
         })
 
-    demo_rows = sum(r["demo_rows"] for r in conn.execute("SELECT * FROM v_demo_isolation"))
+    from . import demo as demo_mod
+    state = demo_mod.status(conn)
     return {
         "meta": {
             "generated_at": utcnow(),
             "today": days[0]["day_date"] if days else utcnow()[:10],
             "calc_version": config.CALC_VERSION,
-            "demo_rows": demo_rows,
+            "mode": "demo" if demo else "real",
+            "demo_rows": state["demo_rows"],
+            "real_rows": state["real_rows"],
+            "mixed": state["mixed"],
+            "warnings": demo_mod.guard_report(conn),
             "source": "live",
         },
         "days": days,

@@ -36,9 +36,16 @@ def _hash(direction, strength, thesis, invalidation, sources) -> str:
 
 def record(conn, trading_day_id: int, *, direction: str, strength: Optional[int] = None,
            thesis: Optional[str] = None, invalidation: Optional[str] = None,
+           invalidation_level: Optional[float] = None,
            sources: Optional[List[str]] = None, capture_seconds: Optional[int] = None,
            recorded_at: Optional[str] = None, is_demo: bool = False) -> int:
-    """Write the morning read. Once per day; after that it can only be amended."""
+    """Write the morning read. Once per day; after that it can only be amended.
+
+    `invalidation_level` is the prose invalidation written as a number, when
+    there is one. It is optional and stays optional: it exists so a bias can
+    eventually be judged against its author's own stated terms, and no
+    methodology is approved to do that yet.
+    """
     if direction not in DIRECTIONS:
         raise ValueError(f"direction must be one of {DIRECTIONS}")
     if strength is not None and not 1 <= strength <= 5:
@@ -46,6 +53,8 @@ def record(conn, trading_day_id: int, *, direction: str, strength: Optional[int]
     for source in sources or []:
         if source not in SOURCES:
             raise ValueError(f"unknown bias source '{source}'")
+    if invalidation_level is not None:
+        invalidation_level = float(invalidation_level)
 
     existing = conn.execute("SELECT id FROM daily_bias WHERE trading_day_id=?",
                             (trading_day_id,)).fetchone()
@@ -55,10 +64,10 @@ def record(conn, trading_day_id: int, *, direction: str, strength: Optional[int]
     payload = json.dumps(sources or [])
     cur = conn.execute(
         "INSERT INTO daily_bias(trading_day_id,recorded_at,direction,strength,thesis,"
-        "invalidation,sources,capture_seconds,original_hash,is_demo)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "invalidation,invalidation_level,sources,capture_seconds,original_hash,is_demo)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (trading_day_id, recorded_at or utcnow(), direction, strength, thesis,
-         invalidation, payload, capture_seconds,
+         invalidation, invalidation_level, payload, capture_seconds,
          _hash(direction, strength, thesis, invalidation, sources), 1 if is_demo else 0))
     conn.commit()
     return cur.lastrowid

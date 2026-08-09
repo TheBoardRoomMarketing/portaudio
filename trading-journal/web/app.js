@@ -486,34 +486,72 @@
       "</section>";
   }
 
+  function acctRow(a, extra) {
+    return '<div class="acct-row' + (extra || "") + '"><div style="min-width:0">' +
+      '<div class="nm">' + esc(a.account_label) +
+      (a.role_at_time === "LEAD" ? ' <span class="chip chip-cyan">lead</span>' : "") +
+      "</div>" +
+      '<div class="sub">' + a.event_count + " fills · peak " + num(a.max_position, 0) +
+      (a.entry_slippage_points != null
+        ? " · " + (a.entry_slippage_points > 0 ? "+" : "") +
+          num(a.entry_slippage_points, 2) + " vs lead" : "") + "</div></div>" +
+      '<div class="val ' + sign(a.realized_pnl) + '">' +
+      money(a.realized_pnl, { cents: false }) + "</div>" +
+      "<div>" + ((a.discrepancies || []).length
+        ? '<span class="chip chip-amber">off</span>'
+        : '<span class="chip chip-ghost">ok</span>') + "</div></div>";
+  }
+
+  // Exception-first. Ten identical follower rows is ten rows of nothing: the
+  // copier did its job and reading them changes no decision. What deserves the
+  // screen is the lead — the actual decision — and any account that failed to
+  // reproduce it. The matched ones collapse to one line, still one tap away,
+  // because "I want to check" is a real need and hiding data is not the goal.
   function copyPanel(t, lead, off) {
     var accounts = t.accounts || [];
+    var offIds = {};
+    off.forEach(function (a) { offIds[a.account_id] = true; });
+    var followers = accounts.filter(function (a) { return a.role_at_time !== "LEAD"; });
+    var matched = followers.filter(function (a) { return !offIds[a.account_id]; });
+    var matchedPnl = matched.reduce(function (s, a) { return s + (a.realized_pnl || 0); }, 0);
+
+    var headline = lead
+      ? "Lead + " + plural(followers.length, "follower")
+      : plural(accounts.length, "account");
+    var verdict = off.length
+      ? matched.length + " matched" + " · " +
+        '<span class="amber">' + plural(off.length, "discrepancy", "discrepancies") +
+        "</span>"
+      : matched.length + " matched";
+
     return '<section class="card"><div class="card-head">' +
-      '<span class="eyebrow">Accounts</span>' +
-      '<span class="muted small">' + plural(accounts.length, "account") + "</span></div>" +
+      '<span class="eyebrow">Copy</span>' +
+      '<span class="muted small">' + headline + " · " + verdict + "</span></div>" +
+
       (off.length
         ? '<div class="warn" style="margin-bottom:14px"><span class="g">off copy</span>' +
           "<p>" + off.map(function (a) {
             return "<b>" + esc(a.account_label) + "</b> — " +
               a.discrepancies.map(function (d) { return esc(d.detail); }).join("; ");
-          }).join("<br>") + "</p></div>"
-        : '<p class="small muted" style="margin-bottom:12px">Every account reproduced the ' +
-          "lead.</p>") +
-      accounts.map(function (a) {
-        return '<div class="acct-row"><div style="min-width:0">' +
-          '<div class="nm">' + esc(a.account_label) +
-          (a.role_at_time === "LEAD" ? ' <span class="chip chip-cyan">lead</span>' : "") +
-          "</div>" +
-          '<div class="sub">' + a.event_count + " fills · peak " + num(a.max_position, 0) +
-          (a.entry_slippage_points != null
-            ? " · " + (a.entry_slippage_points > 0 ? "+" : "") +
-              num(a.entry_slippage_points, 2) + " vs lead" : "") + "</div></div>" +
-          '<div class="val ' + sign(a.realized_pnl) + '">' +
-          money(a.realized_pnl, { cents: false }) + "</div>" +
-          "<div>" + ((a.discrepancies || []).length
-            ? '<span class="chip chip-amber">off</span>'
-            : '<span class="chip chip-ghost">ok</span>') + "</div></div>";
-      }).join("") +
+          }).join("<br>") + "</p>" +
+          '<p class="small" style="margin-top:8px">A copier miss is a system event, not ' +
+          "something you did. It is not counted against process.</p></div>"
+        : "") +
+
+      (lead ? acctRow(lead, offIds[lead.account_id] ? " off" : "") : "") +
+      off.filter(function (a) { return a.role_at_time !== "LEAD"; })
+         .map(function (a) { return acctRow(a, " off"); }).join("") +
+
+      (matched.length
+        ? '<details class="matched"><summary>' +
+          '<span class="chip chip-ghost">ok</span> ' +
+          plural(matched.length, "follower") + " reproduced the lead · " +
+          '<span class="' + sign(matchedPnl) + '">' +
+          money(matchedPnl, { cents: false }) + "</span></summary>" +
+          matched.map(function (a) { return acctRow(a); }).join("") +
+          "</details>"
+        : "") +
+
       '<p class="small muted" style="margin-top:12px">Statistics count this as ' +
       "<b>one</b> trade. Ten accounts copying one decision are one observation, not ten." +
       "</p></section>";
@@ -581,7 +619,13 @@
       '<div class="field" style="margin-bottom:18px">' +
       '<span class="eyebrow">Invalidated if (optional)</span>' +
       '<textarea rows="2" data-field="invalidation" ' +
-      'placeholder="Acceptance back below the overnight low."></textarea></div>' +
+      'placeholder="Acceptance back below the overnight low."></textarea>' +
+      // The level as a number, next to the prose rather than instead of it.
+      // It is what would let the read be judged on its own stated terms later.
+      // Nothing scores it today and nothing is obliged to fill it in.
+      '<input type="number" step="0.01" inputmode="decimal" data-field="invalidation_level" ' +
+      'placeholder="…the level, as a number (optional)" style="margin-top:8px">' +
+      "</div>" +
 
       '<div class="field" style="margin-bottom:20px"><span class="eyebrow">Where it came from' +
       "</span>" +
@@ -815,6 +859,8 @@
     if (!body.direction) { toast("Pick a direction first", "err"); return; }
     body.date = TODAY;
     if (body.strength) body.strength = Number(body.strength);
+    body.invalidation_level = body.invalidation_level
+      ? Number(body.invalidation_level) : null;
     body.capture_seconds = Math.round((Date.now() - MOUNTED) / 1000);
     run(button, "/api/bias", body, "Morning read saved.");
   }

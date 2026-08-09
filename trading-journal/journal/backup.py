@@ -8,6 +8,11 @@ in it.
 
 A backup nobody has restored is a hypothesis. `verify_backup` restores into a
 scratch location and checks the row counts match the manifest.
+
+An archive can also be encrypted, because a backup is the copy that leaves the
+machine — onto an external disk, into a sync folder, off to wherever. The whole
+archive is encrypted, manifest included: row counts are themselves information
+about how someone trades. See journal/crypto.py for key handling.
 """
 
 from __future__ import annotations
@@ -22,11 +27,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import config, db
+from . import config, crypto, db
 from .db import sha256_file, utcnow
 
 MANIFEST_NAME = "manifest.json"
 SNAPSHOT_NAME = "journal.db"
+ENCRYPTED_SUFFIX = ".enc"
 
 # Tables whose counts go in the manifest. A restore that loses rows in any of
 # these is a failed restore, not a partial success.
@@ -48,8 +54,67 @@ def _counts(conn) -> dict:
     return out
 
 
+def is_encrypted(archive: Path) -> bool:
+    """True if this file is one of our encrypted archives.
+
+    Decided by the header bytes rather than the filename, so a renamed archive
+    still opens and a plain tarball named `.enc` still fails honestly.
+    """
+    path = Path(archive)
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(crypto.MAGIC)) == crypto.MAGIC
+    except OSError:
+        return False
+
+
+def _should_encrypt(requested: Optional[bool]) -> bool:
+    """Resolve the encryption decision.
+
+    True  — encrypt, creating a key if there is none yet (the opt-in).
+    False — plain archive, even if a key exists.
+    None  — encrypt only if a key already exists. This is what makes the opt-in
+            sticky: once Zack has a key, every later backup is encrypted without
+            having to remember a flag.
+    """
+    if requested is False:
+        return False
+    if requested is True:
+        return True
+    if config.BACKUP_ENCRYPT in ("0", "false", "never", "off"):
+        return False
+    if config.BACKUP_ENCRYPT in ("1", "true", "always", "on"):
+        return True
+    try:
+        return crypto.get_key(create=False) is not None
+    except crypto.KeyError_:
+        return False
+
+
+def _encrypt_archive(plain: Path, encrypted: Path) -> None:
+    key = crypto.get_key(create=True)
+    encrypted.write_bytes(crypto.encrypt(plain.read_bytes(), key))
+    plain.unlink()
+
+
+def _plaintext_archive(archive: Path, tmp: Path) -> Path:
+    """Return a readable tarball, decrypting into `tmp` if it is encrypted."""
+    if not is_encrypted(archive):
+        return archive
+    key = crypto.get_key(create=False)
+    if key is None:
+        raise RuntimeError(
+            f"{archive.name} is encrypted and no key was found "
+            f"({crypto.key_status()['location']}). Without the key the archive "
+            "cannot be opened — that is the point of encrypting it.")
+    out = tmp / (archive.name[:-len(ENCRYPTED_SUFFIX)]
+                 if archive.name.endswith(ENCRYPTED_SUFFIX) else archive.name + ".tar.gz")
+    out.write_bytes(crypto.decrypt(archive.read_bytes(), key))
+    return out
+
+
 def create(conn, *, label: str = "", include_media: bool = True,
-           dest_dir: Optional[Path] = None) -> Path:
+           dest_dir: Optional[Path] = None, encrypt: Optional[bool] = None) -> Path:
     """Write a self-describing backup archive.
 
     Contents: a consistent database snapshot, the raw imports, the media, the
@@ -95,10 +160,15 @@ def create(conn, *, label: str = "", include_media: bool = True,
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(staging, arcname=name)
 
+    if _should_encrypt(encrypt):
+        sealed = archive.with_name(archive.name + ENCRYPTED_SUFFIX)
+        _encrypt_archive(archive, sealed)
+        return sealed
     return archive
 
 
 def _extract(archive: Path, into: Path) -> Path:
+    archive = _plaintext_archive(Path(archive), Path(into))
     with tarfile.open(archive, "r:gz") as tar:
         members = tar.getmembers()
         for m in members:
@@ -147,6 +217,7 @@ def verify(archive: Path) -> dict:
             conn.close()
 
     return {"ok": not problems, "archive": str(archive), "problems": problems,
+            "encrypted": is_encrypted(archive),
             "created_at": manifest.get("created_at"),
             "schema": manifest.get("schema", {}).get("current")}
 
@@ -184,8 +255,9 @@ def restore(archive: Path, db_path: Optional[Path] = None, *,
 def prune(keep: int = 30, dest_dir: Optional[Path] = None) -> list:
     """Keep the most recent N archives. Returns what was removed."""
     dest_dir = Path(dest_dir or config.BACKUP_DIR)
-    archives = sorted(dest_dir.glob("journal-*.tar.gz"), key=lambda p: p.stat().st_mtime,
-                      reverse=True)
+    archives = sorted((p for p in dest_dir.glob("journal-*.tar.gz*")
+                       if p.suffix in (".gz", ENCRYPTED_SUFFIX)),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
     removed = []
     for old in archives[keep:]:
         old.unlink()

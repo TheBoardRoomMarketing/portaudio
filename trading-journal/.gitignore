@@ -2,3 +2,9 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Encryption keys, wherever JOURNAL_HOME happens to point. data/ already covers
+# the default location; this covers the case where someone moves it inside the
+# repository and would otherwise commit the one file that must never be shared.
+backup.key
+*.key

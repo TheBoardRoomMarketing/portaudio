@@ -11,6 +11,9 @@
     journal backup               create and verify a backup archive
     journal restore <archive>    restore from an archive
     journal verify <archive>     restore into scratch and check against manifest
+    journal keys                 backup encryption key status (never prints the key)
+    journal demo                 synthetic-data status, and purge before real capture
+    journal access               phone access: addresses, token, what to do
     journal job <name>           run a scheduled job (used by launchd/cron)
     journal weekly [week]        generate and store a descriptive weekly report
     journal friction             capture-friction telemetry
@@ -26,7 +29,8 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from . import backup, config, contracts, db, enrich, importers, metrics, reports, repo
+from . import (access, backup, config, contracts, crypto, db, demo, enrich, importers,
+               metrics, reports, repo)
 from .db import utcnow
 
 
@@ -62,18 +66,43 @@ def cmd_serve(args) -> int:
     finally:
         conn.close()
 
+    host = args.host
+    if args.phone and host == config.SERVER_HOST:
+        # --phone means "the address the phone should use". Prefer Tailscale;
+        # fall back to the LAN address, which is honestly labelled as weaker.
+        candidates = [a for a in access.local_addresses() if a["kind"] != "loopback"]
+        if not candidates:
+            print("no Tailscale or private address found on this machine. "
+                  "Run `journal access` for what to do about it.", file=sys.stderr)
+            return 1
+        host = candidates[0]["address"]
+
     server = None
     try:
         from . import api
-        server = api.serve(args.host, args.port, verbose=args.verbose)
+        server = api.serve(host, args.port, verbose=args.verbose)
+    except access.AccessError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except OSError as exc:
-        print(f"could not bind {args.host}:{args.port} — {exc}", file=sys.stderr)
+        print(f"could not bind {host}:{args.port} — {exc}", file=sys.stderr)
         return 1
 
-    url = f"http://{args.host}:{args.port}/"
-    print(f"Trading Journal running at {url}")
+    plan = server.plan
+    url = access.phone_url(host, args.port, plan["token"])
+    print(f"Trading Journal running at http://{host}:{args.port}/")
     print(f"database {config.DB_PATH}")
-    print("local only — nothing is exposed to the network. ctrl-c to stop.")
+    print(plan["transport"])
+    if plan["require_token"]:
+        # Printed to the terminal because it has to be typed into a phone once.
+        # It is not written to the request log, and the first request swaps it
+        # for a cookie so it stops travelling in URLs.
+        print("\nOpen this once on the phone, then bookmark what the address bar shows:")
+        print(f"  {url}")
+        print("Rotate it any time with `journal access --rotate`.")
+    else:
+        print("local only — nothing is exposed to the network.")
+    print("\nctrl-c to stop.")
     if args.open:
         webbrowser.open(url)
     try:
@@ -159,15 +188,63 @@ def cmd_export(args) -> int:
 
 
 def cmd_backup(args) -> int:
+    encrypt = True if args.encrypt else (False if args.no_encrypt else None)
     conn = db.connect()
     try:
-        archive = backup.create(conn, label=args.label)
+        archive = backup.create(conn, label=args.label, encrypt=encrypt)
     finally:
         conn.close()
+    # Verified by opening it the way a restore would, which for an encrypted
+    # archive means the key is exercised too. An archive that verifies is an
+    # archive that can actually be restored on this machine.
     check = backup.verify(archive)
-    _out({"archive": str(archive), "verification": check,
-          "pruned": backup.prune(args.keep)})
+    _out({"archive": str(archive), "encrypted": check["encrypted"],
+          "cipher": crypto.cipher_name() if check["encrypted"] else None,
+          "verification": check, "pruned": backup.prune(args.keep)})
     return 0 if check["ok"] else 1
+
+
+def cmd_keys(args) -> int:
+    """Inspect or create the backup encryption key. Never prints the key."""
+    if args.create:
+        crypto.get_key(create=True)
+    payload = {"key": crypto.key_status(), "cipher": crypto.cipher_name()}
+    if args.self_test:
+        payload["self_test"] = crypto.self_test()
+    _out(payload)
+    return 0 if payload["key"]["problem"] is None else 1
+
+
+def cmd_access(args) -> int:
+    """Phone access: what this machine offers, and the token. Advice, not action."""
+    if args.rotate:
+        access.rotate_token()
+        print("token rotated — every existing phone bookmark is now invalid")
+    if args.clear:
+        print("token removed" if access.clear_token() else "no token to remove")
+    payload = access.guidance()
+    if args.show_token:
+        token = access.get_token(create=False)
+        payload["token_value"] = token or "(none — created on first non-loopback serve)"
+    _out(payload)
+    return 0
+
+
+def cmd_demo(args) -> int:
+    conn = db.connect()
+    try:
+        if args.purge:
+            _out(demo.purge(conn))
+        else:
+            state = demo.status(conn)
+            state["warnings"] = demo.guard_report(conn)
+            _out(state)
+            if args.require_clean and not state["clean_for_real_use"]:
+                print("demo rows present — not clean for real capture", file=sys.stderr)
+                return 1
+    finally:
+        conn.close()
+    return 0
 
 
 def cmd_restore(args) -> int:
@@ -263,9 +340,19 @@ def cmd_weekly(args) -> int:
 def cmd_friction(args) -> int:
     conn = db.connect()
     try:
-        _out(reports.friction(conn))
+        # Two models, reported separately rather than blended: the session-model
+        # numbers are real history, and the day-model numbers are the workflow
+        # in use now. Averaging them would describe neither.
+        _out({"days": reports.day_friction(conn), "sessions": reports.friction(conn)})
     finally:
         conn.close()
+    return 0
+
+
+def cmd_bias_methods(args) -> int:
+    """The candidate bias-outcome methodologies. Nothing is approved or run."""
+    from . import bias_outcome
+    _out(bias_outcome.compare())
     return 0
 
 
@@ -324,7 +411,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, default=config.SERVER_PORT)
     s.add_argument("--open", action="store_true", help="open a browser window")
     s.add_argument("--verbose", action="store_true")
+    s.add_argument("--phone", action="store_true",
+                   help="bind the address the phone can reach (Tailscale if present, "
+                        "otherwise LAN). Token authentication is switched on.")
     s.set_defaults(func=cmd_serve)
+
+    s = sub.add_parser("access", help="phone access: addresses, token, what to do")
+    s.add_argument("--rotate", action="store_true", help="mint a new token")
+    s.add_argument("--clear", action="store_true", help="remove the token")
+    s.add_argument("--show-token", action="store_true", help="print the token value")
+    s.set_defaults(func=cmd_access)
 
     s = sub.add_parser("status", help="integrity, counts, coverage, integrations")
     s.set_defaults(func=cmd_status)
@@ -351,7 +447,23 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("backup", help="create and verify a backup archive")
     s.add_argument("--label", default="")
     s.add_argument("--keep", type=int, default=30)
+    s.add_argument("--encrypt", action="store_true",
+                   help="encrypt the archive, creating a key if there is none yet")
+    s.add_argument("--no-encrypt", action="store_true",
+                   help="write a plain archive even though a key exists")
     s.set_defaults(func=cmd_backup)
+
+    s = sub.add_parser("keys", help="backup encryption key status (never prints the key)")
+    s.add_argument("--create", action="store_true", help="create the key if absent")
+    s.add_argument("--self-test", action="store_true",
+                   help="round-trip and tamper-check with an ephemeral key")
+    s.set_defaults(func=cmd_keys)
+
+    s = sub.add_parser("demo", help="synthetic-data status, and purge before real capture")
+    s.add_argument("--purge", action="store_true", help="delete every demo row")
+    s.add_argument("--require-clean", action="store_true",
+                   help="exit non-zero if any demo row is present")
+    s.set_defaults(func=cmd_demo)
 
     s = sub.add_parser("restore", help="restore from an archive")
     s.add_argument("archive")
@@ -379,6 +491,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("friction", help="capture-friction telemetry")
     s.set_defaults(func=cmd_friction)
+
+    s = sub.add_parser("bias-methods",
+                       help="candidate bias-outcome methodologies (none approved)")
+    s.set_defaults(func=cmd_bias_methods)
 
     s = sub.add_parser("review", help="the real-use checkpoint report")
     s.set_defaults(func=cmd_review)

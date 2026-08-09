@@ -261,6 +261,84 @@ def friction(conn) -> dict:
     }
 
 
+DAY_TARGETS = {"bias_seconds": 60, "review_seconds_per_trade": 90, "close_seconds": 120}
+
+
+def day_friction(conn) -> dict:
+    """Capture cost on the model actually in use: days, biases and reviews.
+
+    The session-model report above still runs, because the older sessions are
+    real evidence. This one measures the workflow Zack is on now.
+
+    Every rate here is over days that exist. A day with no bias counts against
+    morning capture — that is the number worth seeing, and quietly excluding it
+    would turn a missed morning into a clean record.
+    """
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM v_day_capture_quality ORDER BY day_date")]
+    if not rows:
+        return {"days": 0, "note": "no real trading days yet — this fills in with use"}
+
+    def rate(predicate) -> float:
+        return round(sum(1 for r in rows if predicate(r)) / len(rows), 3)
+
+    bias_times = [r["bias_seconds"] for r in rows if r["bias_seconds"] is not None]
+    close_times = [r["close_seconds"] for r in rows if r["close_seconds"] is not None]
+    trades = sum(r["trades"] for r in rows)
+    reviewed = sum(r["trades_reviewed"] for r in rows)
+    review_seconds = [r["review_seconds_total"] for r in rows
+                      if r["review_seconds_total"] is not None]
+    manual = sum(r["manual_events"] for r in rows)
+    imported = sum(r["imported_events"] for r in rows)
+
+    return {
+        "days": len(rows),
+        "first_day": rows[0]["day_date"],
+        "last_day": rows[-1]["day_date"],
+        "completion": {
+            "morning_bias": rate(lambda r: r["has_bias"]),
+            "evening_reflection": rate(lambda r: r["has_reflection"]),
+            "both": rate(lambda r: r["has_bias"] and r["has_reflection"]),
+            "trades_reviewed": round(reviewed / trades, 3) if trades else None,
+        },
+        "seconds": {
+            "bias_median": _median(bias_times),
+            "bias_worst": max(bias_times) if bias_times else None,
+            "bias_over_target": sum(1 for v in bias_times if v > DAY_TARGETS["bias_seconds"]),
+            "close_median": _median(close_times),
+            "review_median_per_day": _median(review_seconds),
+            "targets": DAY_TARGETS,
+            "unmeasured_days": sum(1 for r in rows if r["bias_seconds"] is None),
+        },
+        "backlog": {
+            "unreviewed_trades": trades - reviewed,
+            "needing_grouping_review": sum(r["trades_needing_grouping"] for r in rows),
+            "note": "A growing backlog is the earliest sign the evening review is too "
+                    "long, well before anyone reports it as annoying.",
+        },
+        "manual_burden": {
+            "manual_events": manual,
+            "imported_events": imported,
+            "manual_share": round(manual / (manual + imported), 3)
+                            if (manual + imported) else None,
+            "note": "Every manual event is a fill keyed by hand. This is the number an "
+                    "export sample from TradeSea or TradeSyncer would move.",
+        },
+        "bias_capture_depth": {
+            "with_invalidation_text": rate(lambda r: r["has_invalidation_text"]),
+            "with_invalidation_level": rate(lambda r: r["has_invalidation_level"]),
+            "amended_days": sum(1 for r in rows if r["bias_amendments"]),
+            "note": "A numeric invalidation level is what one candidate outcome "
+                    "methodology needs. No methodology is approved and no outcome is "
+                    "assigned; this only measures whether the option stays open.",
+        },
+        "attachments": {
+            "voice_notes": sum(r["voice_notes"] for r in rows),
+            "media_assets": sum(r["media_assets"] for r in rows),
+        },
+    }
+
+
 def real_use_review(conn) -> dict:
     """The first real-use checkpoint: 20 sessions or four weeks, whichever first.
 
