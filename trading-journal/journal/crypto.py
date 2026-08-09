@@ -212,6 +212,53 @@ def export_key() -> str:
     return base64.b64encode(key).decode()
 
 
+def forget_key() -> bool:
+    """Remove the stored key. Returns True if there was one.
+
+    This turns encryption OFF, because "auto" encrypts only when a key exists.
+    That is the intended way to stop: a journal on an already-encrypted laptop,
+    backing up to that same laptop, gains little from a second layer and loses a
+    great deal if the key goes missing. Encryption here is worth it when
+    archives leave the machine — a sync folder, an external disk, a cloud drive.
+
+    Archives already encrypted under the key stay encrypted, and stay
+    unopenable without it, so the caller is told to deal with them.
+    """
+    source = key_source()
+    if get_key(create=False) is None:
+        return False
+    if source == "keychain":
+        subprocess.run(["security", "delete-generic-password", "-s", SERVICE,
+                        "-a", ACCOUNT], capture_output=True, timeout=15)
+    else:
+        _key_file_path().unlink(missing_ok=True)
+    return True
+
+
+def rotate_key() -> dict:
+    """Replace the key with a new one.
+
+    Every archive encrypted under the old key becomes unopenable, which is why
+    this reports how many exist rather than quietly leaving them behind.
+    """
+    from . import config as _config  # noqa: PLC0415 — avoids a circular import
+
+    backups = Path(_config.BACKUP_DIR)
+    stranded = sorted(backups.glob("journal-*.tar.gz.enc")) if backups.exists() else []
+
+    forget_key()
+    key = get_key(create=True)
+    return {
+        "fingerprint": fingerprint(key),
+        "source": key_source(),
+        "stranded_archives": [p.name for p in stranded],
+        "note": ("Archives listed above were encrypted with the previous key and "
+                 "cannot be opened without it. Delete them, or restore the old key "
+                 "first if you still need them." if stranded else
+                 "No previously encrypted archives existed, so nothing was stranded."),
+    }
+
+
 def import_key(encoded: str, *, force: bool = False) -> dict:
     """Restore a previously exported key — a new machine, or a rebuilt one.
 

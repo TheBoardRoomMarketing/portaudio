@@ -238,6 +238,29 @@ def cmd_keys(args) -> int:
         print("Restore it on a new machine with:  journal keys --import\n")
         return 0
 
+    if args.off:
+        had = crypto.forget_key()
+        stranded = sorted(config.BACKUP_DIR.glob("journal-*.tar.gz.enc")) \
+            if config.BACKUP_DIR.exists() else []
+        for archive in stranded if args.discard_encrypted else []:
+            archive.unlink()
+        print("backup encryption is off — every backup from now on is a plain archive"
+              if had else "there was no key; backups were already plain")
+        if stranded and not args.discard_encrypted:
+            print(f"\n{len(stranded)} existing archive(s) were encrypted with that key and "
+                  "can no longer be opened.\nRe-run with --discard-encrypted to delete them, "
+                  "then take a fresh backup.")
+        elif args.discard_encrypted and stranded:
+            print(f"deleted {len(stranded)} unopenable archive(s)")
+        print("\nTurn it back on any time with: journal backup --encrypt")
+        return 0
+
+    if args.rotate:
+        result = crypto.rotate_key()
+        print(f"new key created (fingerprint {result['fingerprint']}) in {result['source']}")
+        print(result["note"])
+        return 0
+
     if getattr(args, "import_key", False):
         # Read from a prompt, not from argv: a command line lands in shell
         # history and is visible in a process listing while it runs.
@@ -740,6 +763,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="restore an exported key on a new machine (prompts, hidden)")
     s.add_argument("--force", action="store_true",
                    help="with --import, replace a different existing key")
+    s.add_argument("--rotate", action="store_true",
+                   help="replace the key; reports archives stranded by it")
+    s.add_argument("--off", action="store_true",
+                   help="delete the key and stop encrypting backups")
+    s.add_argument("--discard-encrypted", action="store_true",
+                   help="with --off, delete archives that can no longer be opened")
     s.set_defaults(func=cmd_keys)
 
     s = sub.add_parser("accounts", help="register accounts and set lead/follower roles")
