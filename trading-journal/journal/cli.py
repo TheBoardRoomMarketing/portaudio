@@ -14,6 +14,7 @@
     journal keys                 backup encryption key status (never prints the key)
     journal demo                 synthetic-data status, and purge before real capture
     journal access               phone access: addresses, token, what to do
+    journal accounts             register accounts, set lead/follower roles
     journal job <name>           run a scheduled job (used by launchd/cron)
     journal weekly [week]        generate and store a descriptive weekly report
     journal friction             capture-friction telemetry
@@ -228,6 +229,88 @@ def cmd_access(args) -> int:
         payload["token_value"] = token or "(none — created on first non-loopback serve)"
     _out(payload)
     return 0
+
+
+def cmd_accounts(args) -> int:
+    """Register and describe accounts. The setup step before the first real day.
+
+    Grouping is driven by the lead account, so exactly one account has to be
+    marked LEAD before manual capture or import will produce logical trades —
+    and until this existed, preflight could name that problem without offering
+    any way to fix it.
+    """
+    conn = db.connect()
+    try:
+        if args.add or args.set:
+            label = args.add or args.set
+            row = conn.execute("SELECT id, role FROM account WHERE label=?",
+                               (label,)).fetchone()
+            if args.add and row:
+                print(f"an account labelled {label!r} already exists; use --set to change it",
+                      file=sys.stderr)
+                return 1
+            if args.set and not row:
+                print(f"no account labelled {label!r}", file=sys.stderr)
+                return 1
+
+            account_id = row["id"] if row else repo.ensure_account(
+                conn, label, broker=args.broker or "unspecified", mode=args.mode or "paper")
+
+            if args.role == "LEAD":
+                # One lead at a time. Two would make grouping ambiguous in a way
+                # that produces plausible-looking trades on the wrong account.
+                others = conn.execute(
+                    "SELECT label FROM account WHERE role='LEAD' AND is_demo=0 AND id!=?",
+                    (account_id,)).fetchall()
+                if others:
+                    print("already led by: " + ", ".join(o["label"] for o in others) +
+                          ". Demote it first with --role FOLLOWER or --role STANDALONE.",
+                          file=sys.stderr)
+                    return 1
+
+            updates, params = [], []
+            for column, value in (("role", args.role), ("mode", args.mode),
+                                  ("platform", args.platform), ("prop_firm", args.prop_firm),
+                                  ("broker", args.broker), ("external_id", args.external_id)):
+                if value:
+                    updates.append(f"{column}=?")
+                    params.append(value)
+            if args.account_size:
+                updates.append("account_size=?")
+                params.append(float(args.account_size))
+            if args.size_multiplier:
+                updates.append("size_multiplier=?")
+                params.append(float(args.size_multiplier))
+            if args.copies:
+                lead = conn.execute("SELECT id FROM account WHERE label=?",
+                                    (args.copies,)).fetchone()
+                if not lead:
+                    print(f"no account labelled {args.copies!r} to copy from", file=sys.stderr)
+                    return 1
+                updates.append("copy_source_account_id=?")
+                params.append(lead["id"])
+
+            if updates:
+                conn.execute(f"UPDATE account SET {', '.join(updates)} WHERE id=?",
+                             params + [account_id])
+            conn.commit()
+            print(f"{'created' if args.add else 'updated'}: {label}")
+
+        rows = [dict(r) for r in conn.execute(
+            "SELECT a.id, a.label, a.role, a.mode, a.platform, a.prop_firm, a.account_size, "
+            "a.size_multiplier, a.status, l.label AS copies "
+            "FROM account a LEFT JOIN account l ON l.id=a.copy_source_account_id "
+            "WHERE a.is_demo=0 ORDER BY CASE WHEN a.role='LEAD' THEN 0 ELSE 1 END, a.label")]
+        leads = [r for r in rows if r["role"] == "LEAD"]
+        _out({
+            "accounts": rows,
+            "lead": leads[0]["label"] if leads else None,
+            "followers": sum(1 for r in rows if r["role"] == "FOLLOWER"),
+            "ready_for_grouping": len(leads) == 1,
+        })
+    finally:
+        conn.close()
+    return 0 if rows else 1
 
 
 def cmd_sources(args) -> int:
@@ -598,6 +681,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--self-test", action="store_true",
                    help="round-trip and tamper-check with an ephemeral key")
     s.set_defaults(func=cmd_keys)
+
+    s = sub.add_parser("accounts", help="register accounts and set lead/follower roles")
+    s.add_argument("--add", metavar="LABEL", help="create an account")
+    s.add_argument("--set", metavar="LABEL", help="change an existing account")
+    s.add_argument("--role", choices=["LEAD", "FOLLOWER", "STANDALONE"])
+    s.add_argument("--mode", choices=["paper", "live", "sim_eval"])
+    s.add_argument("--copies", metavar="LEAD_LABEL",
+                   help="the lead account this one copies from")
+    s.add_argument("--size-multiplier", help="contracts relative to the lead, e.g. 1.0")
+    s.add_argument("--platform", help="TradeSea, Tradovate, NinjaTrader…")
+    s.add_argument("--prop-firm", help="Tradeify, BluSky, Lucid…")
+    s.add_argument("--account-size", help="e.g. 100000")
+    s.add_argument("--broker")
+    s.add_argument("--external-id", help="the platform's own identifier")
+    s.set_defaults(func=cmd_accounts)
 
     s = sub.add_parser("sources", help="external source mapping and sync health")
     s.add_argument("--map", action="store_true", help="bind a source account to ours")
