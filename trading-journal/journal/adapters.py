@@ -228,10 +228,68 @@ class TradeSyncerAdapter(_BlockedAdapter):
     )
 
 
+class TradeSyncerJournalAdapter(_BlockedAdapter):
+    """The automatic route, declared and switched off.
+
+    TradeSyncer's own journal is the most promising source known: its auto-sync
+    pulls fills from every connected broker account into one place, including
+    fees, and its Manage Data view syncs per account over a chosen date range.
+    If that data can be read out, it carries lead AND follower fills together —
+    which no other single source does.
+
+    What is missing is a way out. No public developer API, no documented export
+    endpoint, and no third-party integration surface could be found. Its
+    documented webhook surface points the wrong way: it is inbound, and it
+    drives execution. Reusing it would put an order-capable credential inside a
+    journal, which §9 rules out on purpose.
+
+    The read operations below are the shape any viable route would take. They
+    raise, because the route has not been established and a plausible-looking
+    fetch that silently returns nothing is worse than one that refuses.
+    """
+
+    name = "tradesyncer_journal"
+    status = BLOCKED_ON_ACCESS
+    needs = (
+        "confirmation, from inside the authenticated app, that the Journaling page "
+        "loads its data from a structured read-only endpoint, and what that response "
+        "looks like at the field level. Nobody outside the account can see this, and "
+        "no credential should be shared to find out — the check is a browser network "
+        "tab, described in the Phase 5A return."
+    )
+    evidence = (
+        "Public research found: auto-sync journaling that imports trades from broker "
+        "connections into TradeSyncer's own journal, syncing all connected accounts "
+        "and storing broker fees; per-account sync with a selectable time range; an "
+        "authenticated web app at app.tradesyncer.com. Not found: any public developer "
+        "API, documented export endpoint, or third-party read integration. The "
+        "documented webhook surface is inbound and execution-driving, which is "
+        "unsuitable for a journal by design rather than by configuration."
+    )
+
+    # The shape a viable route would take. Named here so the boundary is settled
+    # before any client exists, and so the journal never learns TradeSyncer's
+    # response shape — normalisation lives in journal/sources.py.
+    def list_accounts(self):
+        raise NotImplementedContract(self._refusal("list_accounts"))
+
+    def fetch_new_executions(self, since=None, cursor=None):
+        raise NotImplementedContract(self._refusal("fetch_new_executions"))
+
+    def fetch_trade_details(self, trade_id):
+        raise NotImplementedContract(self._refusal("fetch_trade_details"))
+
+    def _refusal(self, operation: str) -> str:
+        return (f"{self.name}.{operation} is {self.status}. No automatic read route has "
+                "been established and none will be guessed at. Nothing here holds a "
+                "credential, and no request is made to any external service.")
+
+
 ADAPTERS = {
     "manual": ManualAdapter(),
     "tradesea": TradeSeaAdapter(),
     "tradesyncer": TradeSyncerAdapter(),
+    "tradesyncer_journal": TradeSyncerJournalAdapter(),
 }
 
 

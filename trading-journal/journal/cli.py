@@ -230,6 +230,35 @@ def cmd_access(args) -> int:
     return 0
 
 
+def cmd_sources(args) -> int:
+    """Source account mapping and sync health. Contacts nothing."""
+    from . import sources
+
+    conn = db.connect()
+    try:
+        if args.map:
+            account = conn.execute("SELECT id FROM account WHERE label=?",
+                                   (args.account,)).fetchone()
+            if not account:
+                print(f"no account labelled {args.account!r}", file=sys.stderr)
+                return 1
+            sources.map_account(conn, source=args.source, source_account_id=args.id,
+                                source_label=args.label, account_id=account["id"],
+                                source_role=args.role)
+            print(f"{args.source}:{args.id} → {args.account}")
+        elif args.retire:
+            sources.retire_mapping(conn, args.source, args.id)
+            print(f"{args.source}:{args.id} retired (kept for old data)")
+
+        _out({"mappings": sources.mapping_report(conn),
+              "role_disagreements": sources.role_disagreements(conn),
+              "sync": sources.sync_health(conn),
+              "adapters": [a for a in contracts.status_report()]})
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_preflight(args) -> int:
     """Everything that should be true before the first real trading day.
 
@@ -569,6 +598,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--self-test", action="store_true",
                    help="round-trip and tamper-check with an ephemeral key")
     s.set_defaults(func=cmd_keys)
+
+    s = sub.add_parser("sources", help="external source mapping and sync health")
+    s.add_argument("--map", action="store_true", help="bind a source account to ours")
+    s.add_argument("--retire", action="store_true", help="close a mapping")
+    s.add_argument("--source", default="tradesyncer")
+    s.add_argument("--id", help="the source's own account identifier")
+    s.add_argument("--label", default="", help="what the source calls it")
+    s.add_argument("--account", help="journal account label")
+    s.add_argument("--role", default="UNKNOWN", choices=["LEAD", "FOLLOWER", "UNKNOWN"],
+                   help="the role the SOURCE reports; never overwrites ours")
+    s.set_defaults(func=cmd_sources)
 
     s = sub.add_parser("preflight",
                        help="everything that should be true before the first real day")
